@@ -18,16 +18,19 @@ DATA_DIR = './ch2025_data_items'
 TARGETS = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
 EXP_TAG = '_all_features_no_lag_pseudolabel'
 BASE_DIR = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = BASE_DIR / 'submissions'
-REPORT_DIR = BASE_DIR / 'outputs'
-SUMMARY_DIR = BASE_DIR / 'summary'
+OUTPUTS_DIR = BASE_DIR / 'outputs'
+OUTPUT_DIR = OUTPUTS_DIR / 'submissions'
+REPORT_DIR = OUTPUTS_DIR / 'report'
+SUMMARY_DIR = OUTPUTS_DIR / 'summary'
+OOF_DIR = OUTPUTS_DIR / 'oof'
+LOG_DIR = OUTPUTS_DIR / 'log'
 
 OUTPUT_PATH = str(OUTPUT_DIR / 'submission_v9.csv')
 REPORT_PATH = str(REPORT_DIR / 'report_v9.txt')
 SUMMARY_PATH = str(SUMMARY_DIR / 'summary_v9.json')
-OOF_PATH = str(REPORT_DIR / 'oof_v9.csv')
+OOF_PATH = str(OOF_DIR / 'oof_v9.csv')
 TEST_PREDS_PATH = str(REPORT_DIR / 'test_preds_v9.csv')
-RUN_LOG_PATH = str(REPORT_DIR / 'run_v9.log')
+RUN_LOG_PATH = str(LOG_DIR / 'run_v9.log')
 
 
 class Tee:
@@ -49,6 +52,8 @@ _stderr = sys.stderr
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
+OOF_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 _run_log_handle = open(RUN_LOG_PATH, 'w', encoding='utf-8')
 sys.stdout = Tee(_stdout, _run_log_handle)
 sys.stderr = Tee(_stderr, _run_log_handle)
