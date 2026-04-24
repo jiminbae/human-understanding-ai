@@ -14,6 +14,22 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Jimin local outputs (generated files)
-jimin/outputs/
+jimin/outputs/*
+!jimin/outputs/.gitkeep
+!jimin/outputs/submissions/
+!jimin/outputs/report/
+!jimin/outputs/summary/
+!jimin/outputs/oof/
+!jimin/outputs/log/
+jimin/outputs/submissions/*
+!jimin/outputs/submissions/.gitkeep
+jimin/outputs/report/*
+!jimin/outputs/report/.gitkeep
+jimin/outputs/summary/*
+!jimin/outputs/summary/.gitkeep
+jimin/outputs/oof/*
+!jimin/outputs/oof/.gitkeep
+jimin/outputs/log/*
+!jimin/outputs/log/.gitkeep
 jimin/submissions/
 jimin/summary/
