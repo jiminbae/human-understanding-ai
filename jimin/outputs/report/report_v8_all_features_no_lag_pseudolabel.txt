@@ -1,0 +1,65 @@
+================================================================================
+제 5회 ETRI 휴먼이해 AI 논문경진대회 - 실험 리포트 (v8_all_features_no_lag_pseudolabel)
+실행 시각: 2026-04-24 16:45:08
+================================================================================
+
+[실험 설정]
+  Experiment Tag       : _all_features_no_lag_pseudolabel
+  USE_SLEEP_REFINED    : True
+  USE_APP_CATEGORY     : True
+  USE_PERSONAL_RELATIVE: True
+  USE_HR_FREQ          : True
+  Device               : cuda
+  Feature count        : 263
+  Train samples        : 450
+  Test samples         : 250
+  N_SPLITS             : 10
+  Optuna trials        : 100 per model per target
+  Seed ensemble        : [42, 123, 777, 2024, 31337, 9999, 7, 314]
+
+================================================================================
+[전체 결과]
+================================================================================
+  Average OOF Log-Loss: 0.4721
+  (v1: 0.5226 / v2: 0.5321 / v3: 0.4678 / v4: 0.4623)
+
+Target  OOF       Seed std    
+--------------------------------------------------
+Q1      0.5481    0.0107      
+Q2      0.4848    0.0079      
+Q3      0.4683    0.0101      
+S1      0.4192    0.0096      
+S2      0.4478    0.0086      
+S3      0.4200    0.0069      
+S4      0.5168    0.0094      
+
+================================================================================
+[Optuna 최적 하이퍼파라미터]
+================================================================================
+
+[Q1]  LGB Fixed params: {"n_estimators": 2000, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 20, "subsample": 0.7, "colsample_bytree": 0.7, "bagging_freq": 5, "reg_alpha": 0.3, "reg_lambda": 2.0, "device": "gpu", "verbose": -1, "force_col_wise": true}
+
+[Q2]  LGB Fixed params: {"n_estimators": 2000, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 20, "subsample": 0.7, "colsample_bytree": 0.7, "bagging_freq": 5, "reg_alpha": 0.3, "reg_lambda": 2.0, "device": "gpu", "verbose": -1, "force_col_wise": true}
+
+[Q3]  LGB Fixed params: {"n_estimators": 2000, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 20, "subsample": 0.7, "colsample_bytree": 0.7, "bagging_freq": 5, "reg_alpha": 0.3, "reg_lambda": 2.0, "device": "gpu", "verbose": -1, "force_col_wise": true}
+
+[S1]  LGB Fixed params: {"n_estimators": 2000, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 20, "subsample": 0.7, "colsample_bytree": 0.7, "bagging_freq": 5, "reg_alpha": 0.3, "reg_lambda": 2.0, "device": "gpu", "verbose": -1, "force_col_wise": true}
+
+[S2]  LGB Fixed params: {"n_estimators": 2000, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 20, "subsample": 0.7, "colsample_bytree": 0.7, "bagging_freq": 5, "reg_alpha": 0.3, "reg_lambda": 2.0, "device": "gpu", "verbose": -1, "force_col_wise": true}
+
+[S3]  LGB Fixed params: {"n_estimators": 2000, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 20, "subsample": 0.7, "colsample_bytree": 0.7, "bagging_freq": 5, "reg_alpha": 0.3, "reg_lambda": 2.0, "device": "gpu", "verbose": -1, "force_col_wise": true}
+
+[S4]  LGB Fixed params: {"n_estimators": 2000, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 20, "subsample": 0.7, "colsample_bytree": 0.7, "bagging_freq": 5, "reg_alpha": 0.3, "reg_lambda": 2.0, "device": "gpu", "verbose": -1, "force_col_wise": true}
+
+================================================================================
+[예측 통계 (Test set)]
+================================================================================
+Target  mean      std       min       max       
+------------------------------------------------------------
+Q1      0.5169    0.1614    0.0539    0.8369    
+Q2      0.6383    0.1245    0.1080    0.9586    
+Q3      0.5897    0.1908    0.0770    0.9630    
+S1      0.6725    0.2253    0.0705    0.9800    
+S2      0.6286    0.2123    0.1052    0.9800    
+S3      0.6326    0.2288    0.0380    0.9800    
+S4      0.5438    0.1817    0.0952    0.9467    
