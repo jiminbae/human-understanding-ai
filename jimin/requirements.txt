@@ -1,0 +1,10 @@
+# Core dependencies for baseline_v8.py and baseline_v9.py
+numpy==2.4.4
+pandas==3.0.2
+scikit-learn==1.8.0
+lightgbm==4.6.0
+xgboost==3.2.0
+catboost==1.2.10
+optuna==4.8.0
+torch==2.11.0
+pyarrow==23.0.1
