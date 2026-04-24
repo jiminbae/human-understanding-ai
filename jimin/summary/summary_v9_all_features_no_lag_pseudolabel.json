@@ -1,0 +1,25 @@
+{
+  "exp_tag": "_all_features_no_lag_pseudolabel",
+  "avg_oof": 0.5829511543097886,
+  "per_target_oof": {
+    "Q1": 0.6013089229809243,
+    "Q2": 0.5997860806851292,
+    "Q3": 0.6003864298829173,
+    "S1": 0.5382704394912186,
+    "S2": 0.5605093598238952,
+    "S3": 0.549405116109118,
+    "S4": 0.6309917311953179
+  },
+  "n_features": 317,
+  "n_train": 450,
+  "n_test": 250,
+  "artifacts": {
+    "submission": "./submission_v9_all_features_no_lag_pseudolabel.csv",
+    "report": "./report_v9_all_features_no_lag_pseudolabel.txt",
+    "summary": "./summary_v9_all_features_no_lag_pseudolabel.json",
+    "oof": "./oof_v9_all_features_no_lag_pseudolabel.csv",
+    "test_preds": "./test_preds_v9_all_features_no_lag_pseudolabel.csv",
+    "run_log": "./run_v9_all_features_no_lag_pseudolabel.log"
+  },
+  "timestamp": "2026-04-24T18:05:43.864561"
+}
