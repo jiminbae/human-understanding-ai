@@ -17,12 +17,17 @@ from sklearn.metrics import log_loss
 DATA_DIR = './ch2025_data_items'
 TARGETS = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
 EXP_TAG = '_all_features_no_lag_pseudolabel'
-OUTPUT_PATH = './submission_v9.csv'
-REPORT_PATH = './report_v9.txt'
-SUMMARY_PATH = './summary_v9.json'
-OOF_PATH = './oof_v9.csv'
-TEST_PREDS_PATH = './test_preds_v9.csv'
-RUN_LOG_PATH = './run_v9.log'
+BASE_DIR = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = BASE_DIR / 'submissions'
+REPORT_DIR = BASE_DIR / 'outputs'
+SUMMARY_DIR = BASE_DIR / 'summary'
+
+OUTPUT_PATH = str(OUTPUT_DIR / 'submission_v9.csv')
+REPORT_PATH = str(REPORT_DIR / 'report_v9.txt')
+SUMMARY_PATH = str(SUMMARY_DIR / 'summary_v9.json')
+OOF_PATH = str(REPORT_DIR / 'oof_v9.csv')
+TEST_PREDS_PATH = str(REPORT_DIR / 'test_preds_v9.csv')
+RUN_LOG_PATH = str(REPORT_DIR / 'run_v9.log')
 
 
 class Tee:
@@ -41,6 +46,9 @@ class Tee:
 
 _stdout = sys.stdout
 _stderr = sys.stderr
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
 _run_log_handle = open(RUN_LOG_PATH, 'w', encoding='utf-8')
 sys.stdout = Tee(_stdout, _run_log_handle)
 sys.stderr = Tee(_stderr, _run_log_handle)
