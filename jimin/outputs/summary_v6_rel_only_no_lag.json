@@ -1,0 +1,21 @@
+{
+  "exp_tag": "_rel_only_no_lag",
+  "flags": {
+    "USE_SLEEP_REFINED": false,
+    "USE_APP_CATEGORY": false,
+    "USE_PERSONAL_RELATIVE": true,
+    "USE_HR_FREQ": false
+  },
+  "avg_oof": 0.46572568840471573,
+  "per_target_oof": {
+    "Q1": 0.5261194684157358,
+    "Q2": 0.4990232049366042,
+    "Q3": 0.5119460409203312,
+    "S1": 0.39401469971650926,
+    "S2": 0.4311656158976148,
+    "S3": 0.40775812729857636,
+    "S4": 0.49005266164763855
+  },
+  "n_features": 198,
+  "timestamp": "2026-04-24T02:38:50.350933"
+}
