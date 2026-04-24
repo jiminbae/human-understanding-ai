@@ -1,2 +1,19 @@
-jimin/ch2025_data_items
+jimin/ch2025_data_items/
 venv/
+
+# Local Python environments
+.venv/
+env/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.so
+
+# Jupyter artifacts
+.ipynb_checkpoints/
+
+# Jimin local outputs (generated files)
+jimin/outputs/
+jimin/submissions/
+jimin/summary/
