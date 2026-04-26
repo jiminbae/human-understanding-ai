@@ -44,9 +44,15 @@ USE_HR_FREQ           = os.environ.get('USE_HR_FREQ',           '1') == '1'
 # 실험 이름 (파일명에 반영됨)
 
 EXP_TAG = "_all_features_no_lag_pseudolabel"  # 예: "_sleep_refined_only", "_app_category_only", "_personal_relative_only", "_hr_freq_only", "_all_features", "_all_features_no_lag_pseudo"
-OUTPUT_PATH = f'./submission_v7{EXP_TAG}.csv'
-REPORT_PATH = f'./report_v7{EXP_TAG}.txt'
+OUTPUT_PATH = f'./outputs/submissions/submission_v7{EXP_TAG}.csv'
+REPORT_PATH = f'./outputs/report/report_v7{EXP_TAG}.txt'
+SUMMARY_PATH = f'./outputs/summary/summary_v7{EXP_TAG}.json'
 OOF_PATH = f'./outputs/oof/oof_v7{EXP_TAG}.csv'
+
+os.makedirs('./outputs/submissions', exist_ok=True)
+os.makedirs('./outputs/report', exist_ok=True)
+os.makedirs('./outputs/summary', exist_ok=True)
+os.makedirs('./outputs/oof', exist_ok=True)
 
 
 TARGET_COLS     = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
@@ -1087,7 +1093,7 @@ def main():
         'n_features': X.shape[1],
         'timestamp': datetime.datetime.now().isoformat(),
     }
-    with open(f'./summary_v7{EXP_TAG}.json', 'w') as f:
+    with open(SUMMARY_PATH, 'w') as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
 

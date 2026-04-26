@@ -33,3 +33,6 @@ jimin/outputs/log/*
 !jimin/outputs/log/.gitkeep
 jimin/submissions/
 jimin/summary/
+jimin/report_v*.txt
+jimin/submission_v*.csv
+jimin/summary_v*.json
