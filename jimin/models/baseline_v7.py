@@ -46,6 +46,7 @@ USE_HR_FREQ           = os.environ.get('USE_HR_FREQ',           '1') == '1'
 EXP_TAG = "_all_features_no_lag_pseudolabel"  # 예: "_sleep_refined_only", "_app_category_only", "_personal_relative_only", "_hr_freq_only", "_all_features", "_all_features_no_lag_pseudo"
 OUTPUT_PATH = f'./submission_v7{EXP_TAG}.csv'
 REPORT_PATH = f'./report_v7{EXP_TAG}.txt'
+OOF_PATH = f'./outputs/oof/oof_v7{EXP_TAG}.csv'
 
 
 TARGET_COLS     = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
@@ -1037,6 +1038,7 @@ def main():
         'n_test':     len(X_test),
         'per_target': {},
     }
+    oof_df = pd.DataFrame(index=train_df.index)
     losses = []
     for t in TARGET_COLS:
         print(f"\n  ▶ {t}")
@@ -1052,6 +1054,7 @@ def main():
         preds, oof, final_loss, seed_losses = train_predict_ensemble_with_pl(
             X, y, X_test, t, lgb_p, xgb_p, cat_p)
         sub[t] = np.clip(preds, 0.02, 0.98)
+        oof_df[f'oof_{t}'] = oof
         losses.append(final_loss)
 
         report_data['per_target'][t] = {
@@ -1063,9 +1066,12 @@ def main():
         }
 
     report_data['avg_loss'] = np.mean(losses)
+    os.makedirs('./outputs/oof', exist_ok=True)
     sub.to_csv(OUTPUT_PATH, index=False)
+    oof_df.to_csv(OOF_PATH, index=False)
     write_report(report_data)
     print(f"\n[제출 파일] {OUTPUT_PATH}")
+    print(f"[OOF 파일] {OOF_PATH}")
 
     # ablation runner가 읽을 수 있도록 avg_loss도 json으로 저장
     summary = {
