@@ -1,4 +1,4 @@
-jimin/ch2025_data_items/
+sejin/ch2025_data_items/
 venv/
 
 # Local Python environments
@@ -12,6 +12,30 @@ __pycache__/
 
 # Jupyter artifacts
 .ipynb_checkpoints/
+
+# Sejin local outputs (generated files)
+sejin/outputs/*
+!sejin/outputs/.gitkeep
+!sejin/outputs/submissions/
+!sejin/outputs/report/
+!sejin/outputs/summary/
+!sejin/outputs/oof/
+!sejin/outputs/log/
+sejin/outputs/submissions/*
+!sejin/outputs/submissions/.gitkeep
+sejin/outputs/report/*
+!sejin/outputs/report/.gitkeep
+sejin/outputs/summary/*
+!sejin/outputs/summary/.gitkeep
+sejin/outputs/oof/*
+!sejin/outputs/oof/.gitkeep
+sejin/outputs/log/*
+!sejin/outputs/log/.gitkeep
+sejin/submissions/
+sejin/summary/
+sejin/report_v*.txt
+sejin/submission_v*.csv
+sejin/summary_v*.json
 
 # Jimin local outputs (generated files)
 jimin/outputs/*
