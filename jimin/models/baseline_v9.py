@@ -14,10 +14,10 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss
 
 
-DATA_DIR = './ch2025_data_items'
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / 'ch2025_data_items'
 TARGETS = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
 EXP_TAG = '_all_features_no_lag_pseudolabel'
-BASE_DIR = Path(__file__).resolve().parents[1]
 OUTPUTS_DIR = BASE_DIR / 'outputs'
 OUTPUT_DIR = OUTPUTS_DIR / 'submissions'
 REPORT_DIR = OUTPUTS_DIR / 'report'
@@ -59,8 +59,8 @@ sys.stdout = Tee(_stdout, _run_log_handle)
 sys.stderr = Tee(_stderr, _run_log_handle)
 
 print('Loading raw data...')
-train_df = pd.read_csv('ch2026_metrics_train.csv')
-sub_df   = pd.read_csv('ch2026_submission_sample.csv')
+train_df = pd.read_csv(str(BASE_DIR / 'ch2026_metrics_train.csv'))
+sub_df   = pd.read_csv(str(BASE_DIR / 'ch2026_submission_sample.csv'))
 train_df['lifelog_date'] = pd.to_datetime(train_df['lifelog_date'])
 sub_df['lifelog_date']   = pd.to_datetime(sub_df['lifelog_date'])
 train_df['sleep_date']   = pd.to_datetime(train_df['sleep_date'])
