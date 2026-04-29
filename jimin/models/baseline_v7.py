@@ -13,6 +13,7 @@ lag 제거
 """
 
 import os, gc, json, warnings, datetime, sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
@@ -31,9 +32,10 @@ warnings.filterwarnings('ignore')
 # 설정
 # ──────────────────────────────────────────────
 
-DATA_DIR        = './ch2025_data_items'
-TRAIN_PATH      = './ch2026_metrics_train.csv'
-SUBMISSION_PATH = './ch2026_submission_sample.csv'
+BASE_DIR        = Path(__file__).resolve().parents[1]
+DATA_DIR        = BASE_DIR / 'ch2025_data_items'
+TRAIN_PATH      = BASE_DIR / 'ch2026_metrics_train.csv'
+SUBMISSION_PATH = BASE_DIR / 'ch2026_submission_sample.csv'
 
 # ★★★ 피처 on/off 플래그 (run_ablation.py에서 환경변수로 덮어씀) ★★★
 USE_SLEEP_REFINED     = os.environ.get('USE_SLEEP_REFINED',     '1') == '1'
@@ -44,15 +46,16 @@ USE_HR_FREQ           = os.environ.get('USE_HR_FREQ',           '1') == '1'
 # 실험 이름 (파일명에 반영됨)
 
 EXP_TAG = "_all_features_no_lag_pseudolabel"  # 예: "_sleep_refined_only", "_app_category_only", "_personal_relative_only", "_hr_freq_only", "_all_features", "_all_features_no_lag_pseudo"
-OUTPUT_PATH = f'./outputs/submissions/submission_v7{EXP_TAG}.csv'
-REPORT_PATH = f'./outputs/report/report_v7{EXP_TAG}.txt'
-SUMMARY_PATH = f'./outputs/summary/summary_v7{EXP_TAG}.json'
-OOF_PATH = f'./outputs/oof/oof_v7{EXP_TAG}.csv'
+OUTPUTS_DIR = BASE_DIR / 'outputs'
+OUTPUT_PATH = str(OUTPUTS_DIR / 'submissions' / f'submission_v7{EXP_TAG}.csv')
+REPORT_PATH = str(OUTPUTS_DIR / 'report' / f'report_v7{EXP_TAG}.txt')
+SUMMARY_PATH = str(OUTPUTS_DIR / 'summary' / f'summary_v7{EXP_TAG}.json')
+OOF_PATH = str(OUTPUTS_DIR / 'oof' / f'oof_v7{EXP_TAG}.csv')
 
-os.makedirs('./outputs/submissions', exist_ok=True)
-os.makedirs('./outputs/report', exist_ok=True)
-os.makedirs('./outputs/summary', exist_ok=True)
-os.makedirs('./outputs/oof', exist_ok=True)
+(OUTPUTS_DIR / 'submissions').mkdir(parents=True, exist_ok=True)
+(OUTPUTS_DIR / 'report').mkdir(parents=True, exist_ok=True)
+(OUTPUTS_DIR / 'summary').mkdir(parents=True, exist_ok=True)
+(OUTPUTS_DIR / 'oof').mkdir(parents=True, exist_ok=True)
 
 
 TARGET_COLS     = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
@@ -992,8 +995,8 @@ def write_report(report_data, path=REPORT_PATH):
 
 def main():
     print("\n[1] 데이터 로딩")
-    train_df = pd.read_csv(TRAIN_PATH)
-    test_df  = pd.read_csv(SUBMISSION_PATH)
+    train_df = pd.read_csv(str(TRAIN_PATH))
+    test_df  = pd.read_csv(str(SUBMISSION_PATH))
 
     print("[2] 날짜 피처")
     train_df = add_date_features(train_df)

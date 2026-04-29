@@ -10,12 +10,14 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import lightgbm as lgb
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, GroupKFold
 from sklearn.metrics import log_loss
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / 'ch2025_data_items'
+TRAIN_PATH = DATA_DIR / 'ch2026_metrics_train.csv'
+SUB_PATH = DATA_DIR / 'ch2026_submission_sample.csv'
 TARGETS = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
 EXP_TAG = '_all_features_no_lag_pseudolabel'
 OUTPUTS_DIR = BASE_DIR / 'outputs'
@@ -25,12 +27,12 @@ SUMMARY_DIR = OUTPUTS_DIR / 'summary'
 OOF_DIR = OUTPUTS_DIR / 'oof'
 LOG_DIR = OUTPUTS_DIR / 'log'
 
-OUTPUT_PATH = str(OUTPUT_DIR / 'submission_v9.csv')
-REPORT_PATH = str(REPORT_DIR / 'report_v9.txt')
-SUMMARY_PATH = str(SUMMARY_DIR / 'summary_v9.json')
-OOF_PATH = str(OOF_DIR / 'oof_v9.csv')
-TEST_PREDS_PATH = str(REPORT_DIR / 'test_preds_v9.csv')
-RUN_LOG_PATH = str(LOG_DIR / 'run_v9.log')
+OUTPUT_PATH = str(OUTPUT_DIR / 'submission_v13.csv')
+REPORT_PATH = str(REPORT_DIR / 'report_v13.txt')
+SUMMARY_PATH = str(SUMMARY_DIR / 'summary_v13.json')
+OOF_PATH = str(OOF_DIR / 'oof_v13.csv')
+TEST_PREDS_PATH = str(REPORT_DIR / 'test_preds_v13.csv')
+RUN_LOG_PATH = str(LOG_DIR / 'run_v13.log')
 
 
 class Tee:
@@ -59,8 +61,8 @@ sys.stdout = Tee(_stdout, _run_log_handle)
 sys.stderr = Tee(_stderr, _run_log_handle)
 
 print('Loading raw data...')
-train_df = pd.read_csv(str(BASE_DIR / 'ch2026_metrics_train.csv'))
-sub_df   = pd.read_csv(str(BASE_DIR / 'ch2026_submission_sample.csv'))
+train_df = pd.read_csv(TRAIN_PATH)
+sub_df   = pd.read_csv(SUB_PATH)
 train_df['lifelog_date'] = pd.to_datetime(train_df['lifelog_date'])
 sub_df['lifelog_date']   = pd.to_datetime(sub_df['lifelog_date'])
 train_df['sleep_date']   = pd.to_datetime(train_df['sleep_date'])
@@ -82,7 +84,7 @@ print(f'train: {train_df.shape}, test: {sub_df.shape}')
 def write_report(report_data, path=REPORT_PATH):
     lines = []
     lines.append('=' * 80)
-    lines.append('Baseline v9 run report')
+    lines.append('Baseline v13 run report')
     lines.append(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f'Experiment tag: {EXP_TAG}')
     lines.append(f'Run log: {RUN_LOG_PATH}')
@@ -651,6 +653,30 @@ lgb_params_base = {
 SEEDS   = [42, 1234, 9999, 7, 314, 2025, 777, 555]
 N_FOLDS = 5
 
+# ── Time-aware Fold 인덱스 미리 생성 ──────────────────────
+def make_time_aware_folds(df, n_folds=5):
+    fold_indices = [[] for _ in range(n_folds)]
+    sorted_df = df.copy()
+    sorted_df['_date_dt'] = pd.to_datetime(sorted_df['lifelog_date'])
+    for sid in sorted(sorted_df['subject_id'].unique()):
+        sid_idx = sorted_df[sorted_df['subject_id'] == sid] \
+                    .sort_values('_date_dt').index.tolist()
+        chunks = np.array_split(sid_idx, n_folds)
+        for f, chunk in enumerate(chunks):
+            fold_indices[f].extend(chunk.tolist())
+    return fold_indices
+
+time_fold_val_indices = make_time_aware_folds(train_full, n_folds=N_FOLDS)
+all_train_idx = set(train_full.index.tolist())
+time_fold_splits = [
+    (
+        sorted(list(all_train_idx - set(val_idx))),
+        val_idx
+    )
+    for val_idx in time_fold_val_indices
+]
+# ──────────────────────────────────────────────────────────
+
 oof_preds  = np.zeros((len(X_train), len(TARGETS)))
 test_preds = np.zeros((len(X_test),  len(TARGETS)))
 
@@ -663,12 +689,11 @@ for ti, target in enumerate(TARGETS):
     n_models = 0
 
     for seed in SEEDS:
-        params = {**lgb_params_base, 'random_state': seed}
-        skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=seed)
+        params = {**lgb_params_base, 'random_state': seed}        
         seed_oof  = np.zeros(len(X_train))
         seed_test = np.zeros(len(X_test))
 
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X_train, y)):
+        for fold, (tr_idx, val_idx) in enumerate(time_fold_splits):
             X_tr, X_val = X_train.iloc[tr_idx], X_train.iloc[val_idx]
             y_tr, y_val = y[tr_idx], y[val_idx]
             model = lgb.LGBMClassifier(**params)
