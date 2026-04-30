@@ -19,7 +19,8 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
-
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING) # Optuna 진행 상황은 요약해서만 보도록 설정
 
 TARGETS = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
 # v12 Advanced: Feature Engineering + Heterogeneous Ensemble
@@ -606,52 +607,19 @@ def build_feature_table(train_df, sub_df):
 # ---------------------------------------------------------------------
 # 🚀 2. 앙상블 고도화 (LGBM + XGBoost + CatBoost 하드보팅/가중평균)
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# 🚀 2 & 3. Optuna 파라미터 튜닝 + 앙상블 스태킹 고도화
+# ---------------------------------------------------------------------
 def train_and_predict(train_full, test_full, feature_cols):
     X_train_base = train_full[feature_cols].copy()
     X_test_base = test_full[feature_cols].copy()
 
-    # -----------------------------------------------------
-    # [Level 0] 기본 부스팅 모델 파라미터 세팅
-    # -----------------------------------------------------
-    lgb_params_base = {
-        'objective': 'binary', 'metric': 'binary_logloss', 'boosting_type': 'gbdt',
-        'num_leaves': 31, 'learning_rate': 0.02, 'feature_fraction': 0.7,
-        'bagging_fraction': 0.7, 'bagging_freq': 5, 'min_child_samples': 20,
-        'reg_alpha': 0.3, 'reg_lambda': 2.0, 'n_estimators': 2000,
-        'verbose': -1, 'n_jobs': -1,
-    }
-    
-    xgb_params_base = {
-        'objective': 'binary:logistic', 'eval_metric': 'logloss',
-        'learning_rate': 0.02, 'max_depth': 6, 'subsample': 0.7,
-        'colsample_bytree': 0.7, 'n_estimators': 2000, 'n_jobs': -1,
-        'early_stopping_rounds': 100 
-    }
-    
-    cat_params_base = {
-        'loss_function': 'Logloss', 'learning_rate': 0.02, 'depth': 6,
-        'iterations': 2000, 'verbose': False, 'thread_count': -1,
-    }
-
-    if HAS_CUDA:
-        lgb_params_base.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
-        xgb_params_base.update({'tree_method': 'hist', 'device': 'cuda'})
-        cat_params_base.update({'task_type': 'GPU'})
-    else:
-        lgb_params_base.update({'device': 'cpu'})
-
-    # -----------------------------------------------------
-    # [Level 1] 메타 모델 파라미터 세팅 (과적합 방지를 위해 로지스틱 회귀 사용)
-    # -----------------------------------------------------
-    meta_params = {
-        'penalty': 'l2',
-        'C': 1.0,
-        'solver': 'lbfgs',
-        'max_iter': 1000
-    }
+    # [Level 1] 메타 모델 파라미터 (고정)
+    meta_params = {'penalty': 'l2', 'C': 1.0, 'solver': 'lbfgs', 'max_iter': 1000}
 
     seeds = [42, 1234, 9999, 7, 314, 2025, 777, 555]
     n_folds = 5
+    n_optuna_trials = 10 # 💡 튜닝 횟수 (테스트용 10회. 시간 여유가 될 때 30~50으로 올리면 성능 극대화!)
 
     oof_preds = np.zeros((len(X_train_base), len(TARGETS)))
     test_preds = np.zeros((len(X_test_base), len(TARGETS)))
@@ -659,114 +627,167 @@ def train_and_predict(train_full, test_full, feature_cols):
 
     for ti, target in enumerate(TARGETS):
         y = train_full[target].values
-        print(f'\n=== Target: {target} | pos_rate: {y.mean():.3f} ===')
+        print(f'\n{"="*40}\n=== Target: {target} | pos_rate: {y.mean():.3f} ===\n{"="*40}')
 
-        # 3개 모델의 앙상블 전, 순수 예측 확률을 담을 그릇 (Level 1의 입력값이 됨)
+        # -----------------------------------------------------
+        # 🎯 [OPTUNA TUNING PHASE] 각 타겟에 맞는 최적 파라미터 찾기
+        # -----------------------------------------------------
+        print(f"  [Optuna] Searching for Golden Parameters (Trials: {n_optuna_trials} per model)...")
+        tune_skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42) # 빠른 튜닝을 위해 3-Fold 사용
+
+        # 1. LightGBM 튜닝
+        def objective_lgb(trial):
+            params = {
+                'objective': 'binary', 'metric': 'binary_logloss', 'boosting_type': 'gbdt',
+                'n_estimators': 300, 'verbose': -1, 'n_jobs': -1, 'random_state': 42,
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                'num_leaves': trial.suggest_int('num_leaves', 15, 63),
+                'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 0.9),
+                'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 0.9),
+                'min_child_samples': trial.suggest_int('min_child_samples', 10, 50)
+            }
+            if HAS_CUDA: params.update({'device': 'gpu'})
+            
+            cv_loss = []
+            for tr_idx, val_idx in tune_skf.split(X_train_base, y):
+                model = lgb.LGBMClassifier(**params)
+                try: model.fit(X_train_base.iloc[tr_idx], y[tr_idx])
+                except: 
+                    params['device'] = 'cpu'
+                    model = lgb.LGBMClassifier(**params)
+                    model.fit(X_train_base.iloc[tr_idx], y[tr_idx])
+                preds = model.predict_proba(X_train_base.iloc[val_idx])[:, 1]
+                cv_loss.append(log_loss(y[val_idx], preds))
+            return np.mean(cv_loss)
+
+        # 2. XGBoost 튜닝
+        def objective_xgb(trial):
+            params = {
+                'objective': 'binary:logistic', 'eval_metric': 'logloss',
+                'n_estimators': 300, 'n_jobs': -1, 'random_state': 42,
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                'max_depth': trial.suggest_int('max_depth', 3, 8),
+                'subsample': trial.suggest_float('subsample', 0.5, 0.9),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 0.9)
+            }
+            if HAS_CUDA: params.update({'tree_method': 'hist', 'device': 'cuda'})
+            
+            cv_loss = []
+            for tr_idx, val_idx in tune_skf.split(X_train_base, y):
+                model = xgb.XGBClassifier(**params)
+                model.fit(X_train_base.iloc[tr_idx], y[tr_idx], verbose=False)
+                preds = model.predict_proba(X_train_base.iloc[val_idx])[:, 1]
+                cv_loss.append(log_loss(y[val_idx], preds))
+            return np.mean(cv_loss)
+
+        # 3. CatBoost 튜닝
+        def objective_cat(trial):
+            params = {
+                'loss_function': 'Logloss', 'iterations': 300, 'verbose': False, 'thread_count': -1, 'random_seed': 42,
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                'depth': trial.suggest_int('depth', 4, 8),
+                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1.0, 10.0)
+            }
+            if HAS_CUDA: params.update({'task_type': 'GPU'})
+            
+            cv_loss = []
+            for tr_idx, val_idx in tune_skf.split(X_train_base, y):
+                model = CatBoostClassifier(**params)
+                model.fit(X_train_base.iloc[tr_idx], y[tr_idx])
+                preds = model.predict_proba(X_train_base.iloc[val_idx])[:, 1]
+                cv_loss.append(log_loss(y[val_idx], preds))
+            return np.mean(cv_loss)
+
+        # 튜닝 실행 및 황금 파라미터 획득
+        study_lgb = optuna.create_study(direction='minimize'); study_lgb.optimize(objective_lgb, n_trials=n_optuna_trials)
+        study_xgb = optuna.create_study(direction='minimize'); study_xgb.optimize(objective_xgb, n_trials=n_optuna_trials)
+        study_cat = optuna.create_study(direction='minimize'); study_cat.optimize(objective_cat, n_trials=n_optuna_trials)
+
+        print(f"    -> [Optuna] Best LGBM Loss: {study_lgb.best_value:.4f}")
+        print(f"    -> [Optuna] Best XGB Loss:  {study_xgb.best_value:.4f}")
+        print(f"    -> [Optuna] Best CAT Loss:  {study_cat.best_value:.4f}")
+
+        # 찾은 최적 파라미터에 실전용 트리 개수(2000)를 덧씌워 최종 파라미터 세팅
+        best_lgb_params = {**study_lgb.best_params, 'objective': 'binary', 'metric': 'binary_logloss', 'boosting_type': 'gbdt', 'n_estimators': 2000, 'verbose': -1, 'n_jobs': -1}
+        best_xgb_params = {**study_xgb.best_params, 'objective': 'binary:logistic', 'eval_metric': 'logloss', 'n_estimators': 2000, 'n_jobs': -1}
+        best_cat_params = {**study_cat.best_params, 'loss_function': 'Logloss', 'iterations': 2000, 'verbose': False, 'thread_count': -1}
+        
+        if HAS_CUDA:
+            best_lgb_params.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
+            best_xgb_params.update({'tree_method': 'hist', 'device': 'cuda'})
+            best_cat_params.update({'task_type': 'GPU'})
+        else:
+            best_lgb_params.update({'device': 'cpu'})
+
+        # -----------------------------------------------------
+        # ⚔️ [MAIN TRAINING PHASE] 최적 파라미터로 8-Seed 앙상블 진행
+        # -----------------------------------------------------
+        print("  [Level 0] Training Main Ensemble with Optimized Parameters...")
         target_oof_lgb = np.zeros(len(X_train_base))
         target_oof_xgb = np.zeros(len(X_train_base))
         target_oof_cat = np.zeros(len(X_train_base))
-
         target_test_lgb = np.zeros(len(X_test_base))
         target_test_xgb = np.zeros(len(X_test_base))
         target_test_cat = np.zeros(len(X_test_base))
 
-        # --- LEVEL 0: 개별 부스팅 모델 학습 ---
         for seed in seeds:
             skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-            seed_oof_lgb = np.zeros(len(X_train_base))
-            seed_oof_xgb = np.zeros(len(X_train_base))
-            seed_oof_cat = np.zeros(len(X_train_base))
-
-            seed_test_lgb = np.zeros(len(X_test_base))
-            seed_test_xgb = np.zeros(len(X_test_base))
-            seed_test_cat = np.zeros(len(X_test_base))
+            seed_oof_lgb, seed_oof_xgb, seed_oof_cat = np.zeros(len(X_train_base)), np.zeros(len(X_train_base)), np.zeros(len(X_train_base))
+            seed_test_lgb, seed_test_xgb, seed_test_cat = np.zeros(len(X_test_base)), np.zeros(len(X_test_base)), np.zeros(len(X_test_base))
 
             for tr_idx, val_idx in skf.split(X_train_base, y):
-                X_tr = X_train_base.iloc[tr_idx].copy()
-                X_val = X_train_base.iloc[val_idx].copy()
-                X_te = X_test_base.copy()
+                X_tr, X_val, X_te = X_train_base.iloc[tr_idx].copy(), X_train_base.iloc[val_idx].copy(), X_test_base.copy()
                 y_tr, y_val = y[tr_idx], y[val_idx]
 
                 if USE_FOLD_SAFE_TE:
                     hist_df = train_full.iloc[tr_idx][['subject_id', 'lifelog_date', target]].copy()
-                    tr_query = train_full.iloc[tr_idx][['subject_id', 'lifelog_date']].copy()
-                    val_query = train_full.iloc[val_idx][['subject_id', 'lifelog_date']].copy()
+                    tr_query, val_query = train_full.iloc[tr_idx][['subject_id', 'lifelog_date']].copy(), train_full.iloc[val_idx][['subject_id', 'lifelog_date']].copy()
                     test_query = test_full[['subject_id', 'lifelog_date']].copy()
+                    tr_te, val_te, test_te = build_fold_safe_target_encoding(hist_df, tr_query, val_query, test_query, target, te_windows)
+                    X_tr, X_val, X_te = pd.concat([X_tr.reset_index(drop=True), tr_te.reset_index(drop=True)], axis=1), pd.concat([X_val.reset_index(drop=True), val_te.reset_index(drop=True)], axis=1), pd.concat([X_te.reset_index(drop=True), test_te.reset_index(drop=True)], axis=1)
 
-                    tr_te, val_te, test_te = build_fold_safe_target_encoding(
-                        hist_df, tr_query, val_query, test_query, target, te_windows)
+                model_lgb = lgb.LGBMClassifier(**{**best_lgb_params, 'random_state': seed})
+                model_xgb = xgb.XGBClassifier(**{**best_xgb_params, 'random_state': seed, 'early_stopping_rounds': 100})
+                model_cat = CatBoostClassifier(**{**best_cat_params, 'random_seed': seed})
 
-                    X_tr = pd.concat([X_tr.reset_index(drop=True), tr_te.reset_index(drop=True)], axis=1)
-                    X_val = pd.concat([X_val.reset_index(drop=True), val_te.reset_index(drop=True)], axis=1)
-                    X_te = pd.concat([X_te.reset_index(drop=True), test_te.reset_index(drop=True)], axis=1)
-
-                # 개별 모델 선언 및 학습
-                model_lgb = lgb.LGBMClassifier(**{**lgb_params_base, 'random_state': seed})
-                model_xgb = xgb.XGBClassifier(**{**xgb_params_base, 'random_state': seed})
-                model_cat = CatBoostClassifier(**{**cat_params_base, 'random_seed': seed})
-
-                try:
-                    model_lgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)])
-                except Exception:
-                    cpu_params = dict(lgb_params_base); cpu_params['device'] = 'cpu'
+                try: model_lgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)])
+                except: 
+                    cpu_params = dict(best_lgb_params); cpu_params['device'] = 'cpu'
                     model_lgb = lgb.LGBMClassifier(**{**cpu_params, 'random_state': seed})
                     model_lgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)])
 
                 model_xgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
                 model_cat.fit(X_tr, y_tr, eval_set=(X_val, y_val), early_stopping_rounds=100, verbose=False)
 
-                # 각 모델별 확률 따로 저장 (합치지 않음!)
-                seed_oof_lgb[val_idx] = model_lgb.predict_proba(X_val)[:, 1]
-                seed_oof_xgb[val_idx] = model_xgb.predict_proba(X_val)[:, 1]
-                seed_oof_cat[val_idx] = model_cat.predict_proba(X_val)[:, 1]
-                
+                seed_oof_lgb[val_idx], seed_oof_xgb[val_idx], seed_oof_cat[val_idx] = model_lgb.predict_proba(X_val)[:, 1], model_xgb.predict_proba(X_val)[:, 1], model_cat.predict_proba(X_val)[:, 1]
                 seed_test_lgb += model_lgb.predict_proba(X_te)[:, 1] / n_folds
                 seed_test_xgb += model_xgb.predict_proba(X_te)[:, 1] / n_folds
                 seed_test_cat += model_cat.predict_proba(X_te)[:, 1] / n_folds
 
-            # 시드별 결과 평균내어 Level 0 그릇에 차곡차곡 담기
-            target_oof_lgb += seed_oof_lgb / len(seeds)
-            target_oof_xgb += seed_oof_xgb / len(seeds)
-            target_oof_cat += seed_oof_cat / len(seeds)
+            target_oof_lgb += seed_oof_lgb / len(seeds); target_oof_xgb += seed_oof_xgb / len(seeds); target_oof_cat += seed_oof_cat / len(seeds)
+            target_test_lgb += seed_test_lgb / len(seeds); target_test_xgb += seed_test_xgb / len(seeds); target_test_cat += seed_test_cat / len(seeds)
 
-            target_test_lgb += seed_test_lgb / len(seeds)
-            target_test_xgb += seed_test_xgb / len(seeds)
-            target_test_cat += seed_test_cat / len(seeds)
-
-        # 각 단일 모델의 OOF 성능 출력
-        print(f"  [Level 0] LogLoss - LGBM: {log_loss(y, target_oof_lgb):.4f}, XGB: {log_loss(y, target_oof_xgb):.4f}, CAT: {log_loss(y, target_oof_cat):.4f}")
-
-        # --- LEVEL 1: 메타 모델 스태킹 ---
-        print("  [Level 1] Training Meta-Model (Stacking)...")
-        # 3개 모델의 확률을 가로로 이어 붙여 새로운 특징(Feature) 3개짜리 데이터셋 생성
+        # -----------------------------------------------------
+        # 🔗 [LEVEL 1] 메타 모델 스태킹
+        # -----------------------------------------------------
+        print("  [Level 1] Training Meta-Model (Stacking) with Optimized Level 0 outputs...")
         X_meta_train = np.column_stack([target_oof_lgb, target_oof_xgb, target_oof_cat])
         X_meta_test = np.column_stack([target_test_lgb, target_test_xgb, target_test_cat])
 
-        meta_oof = np.zeros(len(X_train_base))
-        meta_test = np.zeros(len(X_test_base))
-
-        # 메타 모델 또한 과적합을 막기 위해 5-Fold로 훈련 및 예측
+        meta_oof, meta_test = np.zeros(len(X_train_base)), np.zeros(len(X_test_base))
         meta_skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        
         for meta_tr_idx, meta_val_idx in meta_skf.split(X_meta_train, y):
-            X_meta_tr, X_meta_val = X_meta_train[meta_tr_idx], X_meta_train[meta_val_idx]
-            y_meta_tr, y_meta_val = y[meta_tr_idx], y[meta_val_idx]
-
             meta_model = LogisticRegression(**meta_params)
-            meta_model.fit(X_meta_tr, y_meta_tr)
-
-            meta_oof[meta_val_idx] = meta_model.predict_proba(X_meta_val)[:, 1]
+            meta_model.fit(X_meta_train[meta_tr_idx], y[meta_tr_idx])
+            meta_oof[meta_val_idx] = meta_model.predict_proba(X_meta_train[meta_val_idx])[:, 1]
             meta_test += meta_model.predict_proba(X_meta_test)[:, 1] / n_folds
 
-        target_oof = meta_oof
-        target_test = meta_test
+        target_oof, target_test = meta_oof, meta_test
+        if USE_CALIBRATION: target_oof, target_test = calibrate_probs(y, target_oof, target_test)
 
-        if USE_CALIBRATION:
-            target_oof, target_test = calibrate_probs(y, target_oof, target_test)
-
-        oof_preds[:, ti] = target_oof
-        test_preds[:, ti] = target_test
-
-        print(f'  [Level 1] Final Stacked OOF [{target}]: {log_loss(y, oof_preds[:, ti]):.4f}')
+        oof_preds[:, ti], test_preds[:, ti] = target_oof, target_test
+        print(f'  🎯 [Level 1] Final Stacked OOF [{target}]: {log_loss(y, oof_preds[:, ti]):.4f}')
 
     return oof_preds, test_preds
 
