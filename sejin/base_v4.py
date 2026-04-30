@@ -4,7 +4,7 @@ warnings.filterwarnings('ignore')
 
 import os
 import gc
-import json
+import json 
 import datetime
 import sys
 from pathlib import Path
@@ -1432,7 +1432,9 @@ def train_and_predict(train_full, test_full, feature_cols):
     X_train_base = train_full[feature_cols].copy()
     X_test_base = test_full[feature_cols].copy()
 
-    # LGBM 파라미터
+    # -----------------------------------------------------
+    # [Level 0] 기본 부스팅 모델 파라미터 세팅
+    # -----------------------------------------------------
     lgb_params_base = {
         'objective': 'binary', 'metric': 'binary_logloss', 'boosting_type': 'gbdt',
         'num_leaves': 31, 'learning_rate': 0.02, 'feature_fraction': 0.7,
@@ -1441,15 +1443,13 @@ def train_and_predict(train_full, test_full, feature_cols):
         'verbose': -1, 'n_jobs': -1,
     }
     
-    # XGBoost 파라미터
     xgb_params_base = {
         'objective': 'binary:logistic', 'eval_metric': 'logloss',
         'learning_rate': 0.02, 'max_depth': 6, 'subsample': 0.7,
         'colsample_bytree': 0.7, 'n_estimators': 2000, 'n_jobs': -1,
-        'early_stopping_rounds': 100
+        'early_stopping_rounds': 100 
     }
     
-    # CatBoost 파라미터
     cat_params_base = {
         'loss_function': 'Logloss', 'learning_rate': 0.02, 'depth': 6,
         'iterations': 2000, 'verbose': False, 'thread_count': -1,
@@ -1462,6 +1462,16 @@ def train_and_predict(train_full, test_full, feature_cols):
     else:
         lgb_params_base.update({'device': 'cpu'})
 
+    # -----------------------------------------------------
+    # [Level 1] 메타 모델 파라미터 세팅 (과적합 방지를 위해 로지스틱 회귀 사용)
+    # -----------------------------------------------------
+    meta_params = {
+        'penalty': 'l2',
+        'C': 1.0,
+        'solver': 'lbfgs',
+        'max_iter': 1000
+    }
+
     seeds = [42, 1234, 9999, 7, 314, 2025, 777, 555]
     n_folds = 5
 
@@ -1469,20 +1479,29 @@ def train_and_predict(train_full, test_full, feature_cols):
     test_preds = np.zeros((len(X_test_base), len(TARGETS)))
     te_windows = [3, 7, 14, 21]
 
-    # 가중치 앙상블 비율 (LGBM 40%, XGB 30%, CAT 30%)
-    w_lgb, w_xgb, w_cat = 0.4, 0.3, 0.3
-
     for ti, target in enumerate(TARGETS):
         y = train_full[target].values
         print(f'\n=== Target: {target} | pos_rate: {y.mean():.3f} ===')
 
-        all_oof_prob = np.zeros(len(X_train_base))
-        all_test_prob = np.zeros(len(X_test_base))
+        # 3개 모델의 앙상블 전, 순수 예측 확률을 담을 그릇 (Level 1의 입력값이 됨)
+        target_oof_lgb = np.zeros(len(X_train_base))
+        target_oof_xgb = np.zeros(len(X_train_base))
+        target_oof_cat = np.zeros(len(X_train_base))
 
+        target_test_lgb = np.zeros(len(X_test_base))
+        target_test_xgb = np.zeros(len(X_test_base))
+        target_test_cat = np.zeros(len(X_test_base))
+
+        # --- LEVEL 0: 개별 부스팅 모델 학습 ---
         for seed in seeds:
             skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-            seed_oof = np.zeros(len(X_train_base))
-            seed_test_prob = np.zeros(len(X_test_base))
+            seed_oof_lgb = np.zeros(len(X_train_base))
+            seed_oof_xgb = np.zeros(len(X_train_base))
+            seed_oof_cat = np.zeros(len(X_train_base))
+
+            seed_test_lgb = np.zeros(len(X_test_base))
+            seed_test_xgb = np.zeros(len(X_test_base))
+            seed_test_cat = np.zeros(len(X_test_base))
 
             for tr_idx, val_idx in skf.split(X_train_base, y):
                 X_tr = X_train_base.iloc[tr_idx].copy()
@@ -1503,12 +1522,11 @@ def train_and_predict(train_full, test_full, feature_cols):
                     X_val = pd.concat([X_val.reset_index(drop=True), val_te.reset_index(drop=True)], axis=1)
                     X_te = pd.concat([X_te.reset_index(drop=True), test_te.reset_index(drop=True)], axis=1)
 
-                # 모델 선언
+                # 개별 모델 선언 및 학습
                 model_lgb = lgb.LGBMClassifier(**{**lgb_params_base, 'random_state': seed})
                 model_xgb = xgb.XGBClassifier(**{**xgb_params_base, 'random_state': seed})
                 model_cat = CatBoostClassifier(**{**cat_params_base, 'random_seed': seed})
 
-                # LGBM 학습
                 try:
                     model_lgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)])
                 except Exception:
@@ -1516,34 +1534,53 @@ def train_and_predict(train_full, test_full, feature_cols):
                     model_lgb = lgb.LGBMClassifier(**{**cpu_params, 'random_state': seed})
                     model_lgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100, verbose=False)])
 
-                # XGBoost 학습
                 model_xgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-                
-                # CatBoost 학습
                 model_cat.fit(X_tr, y_tr, eval_set=(X_val, y_val), early_stopping_rounds=100, verbose=False)
 
-                # 확률 예측 후 앙상블 블렌딩 (가중 평균)
-                val_pred = (
-                    model_lgb.predict_proba(X_val)[:, 1] * w_lgb +
-                    model_xgb.predict_proba(X_val)[:, 1] * w_xgb +
-                    model_cat.predict_proba(X_val)[:, 1] * w_cat
-                )
+                # 각 모델별 확률 따로 저장 (합치지 않음!)
+                seed_oof_lgb[val_idx] = model_lgb.predict_proba(X_val)[:, 1]
+                seed_oof_xgb[val_idx] = model_xgb.predict_proba(X_val)[:, 1]
+                seed_oof_cat[val_idx] = model_cat.predict_proba(X_val)[:, 1]
                 
-                te_pred = (
-                    model_lgb.predict_proba(X_te)[:, 1] * w_lgb +
-                    model_xgb.predict_proba(X_te)[:, 1] * w_xgb +
-                    model_cat.predict_proba(X_te)[:, 1] * w_cat
-                )
+                seed_test_lgb += model_lgb.predict_proba(X_te)[:, 1] / n_folds
+                seed_test_xgb += model_xgb.predict_proba(X_te)[:, 1] / n_folds
+                seed_test_cat += model_cat.predict_proba(X_te)[:, 1] / n_folds
 
-                seed_oof[val_idx] = val_pred
-                seed_test_prob += te_pred / n_folds
+            # 시드별 결과 평균내어 Level 0 그릇에 차곡차곡 담기
+            target_oof_lgb += seed_oof_lgb / len(seeds)
+            target_oof_xgb += seed_oof_xgb / len(seeds)
+            target_oof_cat += seed_oof_cat / len(seeds)
 
-            print(f'  seed={seed}: OOF log_loss={log_loss(y, seed_oof):.4f}')
-            all_oof_prob += seed_oof
-            all_test_prob += seed_test_prob
+            target_test_lgb += seed_test_lgb / len(seeds)
+            target_test_xgb += seed_test_xgb / len(seeds)
+            target_test_cat += seed_test_cat / len(seeds)
 
-        target_oof = all_oof_prob / len(seeds)
-        target_test = all_test_prob / len(seeds)
+        # 각 단일 모델의 OOF 성능 출력
+        print(f"  [Level 0] LogLoss - LGBM: {log_loss(y, target_oof_lgb):.4f}, XGB: {log_loss(y, target_oof_xgb):.4f}, CAT: {log_loss(y, target_oof_cat):.4f}")
+
+        # --- LEVEL 1: 메타 모델 스태킹 ---
+        print("  [Level 1] Training Meta-Model (Stacking)...")
+        # 3개 모델의 확률을 가로로 이어 붙여 새로운 특징(Feature) 3개짜리 데이터셋 생성
+        X_meta_train = np.column_stack([target_oof_lgb, target_oof_xgb, target_oof_cat])
+        X_meta_test = np.column_stack([target_test_lgb, target_test_xgb, target_test_cat])
+
+        meta_oof = np.zeros(len(X_train_base))
+        meta_test = np.zeros(len(X_test_base))
+
+        # 메타 모델 또한 과적합을 막기 위해 5-Fold로 훈련 및 예측
+        meta_skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        for meta_tr_idx, meta_val_idx in meta_skf.split(X_meta_train, y):
+            X_meta_tr, X_meta_val = X_meta_train[meta_tr_idx], X_meta_train[meta_val_idx]
+            y_meta_tr, y_meta_val = y[meta_tr_idx], y[meta_val_idx]
+
+            meta_model = LogisticRegression(**meta_params)
+            meta_model.fit(X_meta_tr, y_meta_tr)
+
+            meta_oof[meta_val_idx] = meta_model.predict_proba(X_meta_val)[:, 1]
+            meta_test += meta_model.predict_proba(X_meta_test)[:, 1] / n_folds
+
+        target_oof = meta_oof
+        target_test = meta_test
 
         if USE_CALIBRATION:
             target_oof, target_test = calibrate_probs(y, target_oof, target_test)
@@ -1551,7 +1588,7 @@ def train_and_predict(train_full, test_full, feature_cols):
         oof_preds[:, ti] = target_oof
         test_preds[:, ti] = target_test
 
-        print(f'  Ensemble OOF [{target}]: {log_loss(y, oof_preds[:, ti]):.4f}')
+        print(f'  [Level 1] Final Stacked OOF [{target}]: {log_loss(y, oof_preds[:, ti]):.4f}')
 
     return oof_preds, test_preds
 
@@ -1568,10 +1605,66 @@ def write_report(report_data):
     with open(REPORT_PATH, 'w', encoding='utf-8') as f:
         f.write(text)
     print('\n' + text)
+# ---------------------------------------------------------------------
+# 🚀 3. 고급 피처 셀렉션 (노이즈 컷다운)
+# ---------------------------------------------------------------------
+def perform_feature_selection(train_full, feature_cols, targets, drop_ratio=0.15):
+    print("\n[Feature Selection] Evaluating feature importance to cut noise...")
+    
+    # 컷다운을 위한 가벼운 정찰대(LightGBM) 세팅
+    lgb_params = {
+        'objective': 'binary', 'metric': 'binary_logloss',
+        'boosting_type': 'gbdt', 'learning_rate': 0.05,
+        'n_estimators': 150, 'verbose': -1, 'n_jobs': -1,
+        'random_state': 42
+    }
+    
+    if HAS_CUDA:
+        lgb_params.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
+    else:
+        lgb_params.update({'device': 'cpu'})
+        
+    importance_df = pd.DataFrame({'feature': feature_cols})
+    importance_df['importance'] = 0.0
+    
+    # 7개의 타겟(Q1~S4)에 대해 각각 빠르게 학습해보고 진짜 쓸모있는 피처인지 평가
+    for t in targets:
+        y = train_full[t].values
+        model = lgb.LGBMClassifier(**lgb_params)
+        
+        try:
+            model.fit(train_full[feature_cols], y)
+        except Exception:
+            cpu_params = dict(lgb_params)
+            cpu_params['device'] = 'cpu'
+            model = lgb.LGBMClassifier(**cpu_params)
+            model.fit(train_full[feature_cols], y)
+            
+        # 트리를 나눌 때(Split) 기여한 정보 획득량(Gain) 누적
+        importance_df['importance'] += model.feature_importances_ / len(targets)
+        
+    importance_df = importance_df.sort_values(by='importance', ascending=False).reset_index(drop=True)
+    
+    # 하위 X%의 잉여 피처와, 아예 기여도가 0인 피처를 색출
+    n_drop = int(len(feature_cols) * drop_ratio)
+    drop_features = importance_df.tail(n_drop)['feature'].tolist()
+    zero_imp_features = importance_df[importance_df['importance'] == 0]['feature'].tolist()
+    
+    # 중복 제거 후 최종 퇴출 명단 작성
+    final_drop_list = list(set(drop_features + zero_imp_features))
+    selected_features = [c for c in feature_cols if c not in final_drop_list]
+    
+    print(f"  - Original features: {len(feature_cols)}개")
+    print(f"  - Dropped noise features: {len(final_drop_list)}개 (하위 {drop_ratio*100}% 및 기여도 0)")
+    print(f"  - Selected elite features: {len(selected_features)}개")
+    
+    return selected_features
 
 def main():
     ensure_dirs()
     print('Starting Advanced Training Pipeline...')
+    
+    # --- 데이터 불러오기 ---
     train_df = pd.read_csv(TRAIN_PATH)
     sub_df = pd.read_csv(SUB_PATH)
     train_df['lifelog_date'] = pd.to_datetime(train_df['lifelog_date'])
@@ -1579,9 +1672,17 @@ def main():
     train_df['sleep_date'] = pd.to_datetime(train_df['sleep_date'])
     sub_df['sleep_date'] = pd.to_datetime(sub_df['sleep_date'])
 
+    # 1단계: 모든 피처 생성
     train_full, test_full, feature_cols = build_feature_table(train_df, sub_df)
-    oof_preds, test_preds = train_and_predict(train_full, test_full, feature_cols)
+    
+    # [NEW] 2단계: 본격적인 앙상블 학습 전, 노이즈 피처 컷다운 실행
+    # (하위 15% 및 기여도 0인 노이즈 피처 제거)
+    elite_feature_cols = perform_feature_selection(train_full, feature_cols, TARGETS, drop_ratio=0.15)
+    
+    # 3단계: 걸러진 정예 피처(elite_feature_cols)만 데리고 메인 학습(스태킹) 시작!
+    oof_preds, test_preds = train_and_predict(train_full, test_full, elite_feature_cols)
 
+    # --- 점수 계산 및 검증 ---
     per_target = {}
     for i, t in enumerate(TARGETS):
         per_target[t] = log_loss(train_full[t].values, oof_preds[:, i])
@@ -1598,6 +1699,7 @@ def main():
     print(f'v12 Advanced Pseudo-public OOF: {pseudo_oof_total:.4f}')
     print(f'{"=" * 55}')
 
+    # --- 결과물 저장 (제출 파일 생성) ---
     submission = sub_df[['subject_id', 'sleep_date', 'lifelog_date']].copy()
     for i, t in enumerate(TARGETS):
         submission[t] = test_preds[:, i].clip(0.02, 0.98)
