@@ -1,8 +1,8 @@
-# v22: v20 (Daytime HR) + BLE RSSI 피처 + Ambience 야간 피처 + 12-seed 앙상블
-#   - extract_ble: ble_strong_dev_count (rssi>-70), ble_mean_rssi, ble_night_unique 추가
-#   - extract_ambience: amb_night_speech (22시 이후 대화 비율) 추가
-#   - seeds 8 → 12로 확장 (분산 감소)
-#   - OOF 파일 저장 추가
+# v23: v21 + 안정성 기반 피처 선별 (per-target)
+#   - compute_stability_scores(): 5-fold LGB로 fold간 피처 중요도 일관성 측정
+#   - 타겟별로 비일관 피처 제거 후 Optuna/L0 학습
+#   - STABILITY_THRESHOLD: 5 fold 중 중요도 비제로 비율 (기본 0.6 = 3+/5 fold)
+#   - MAX_STABLE_FEATURES: 타겟별 최대 피처 수 (기본 200)
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -40,6 +40,9 @@ if not (0 < PSEUDO_PUBLIC_TAIL_FRAC < 1):
 FORCE_CPU = os.environ.get('V12_FORCE_CPU', '0') == '1'
 HAS_CUDA  = (not FORCE_CPU) and torch.cuda.is_available() and torch.cuda.device_count() > 0
 
+STABILITY_THRESHOLD = float(os.environ.get('V23_STAB_THRESHOLD', '0.6'))
+MAX_STABLE_FEATURES = int(os.environ.get('V23_MAX_FEATURES', '200'))
+
 BASE_DIR   = Path(__file__).resolve().parent.parent
 DATA_DIR   = BASE_DIR / 'ch2025_data_items'
 TRAIN_PATH = BASE_DIR / 'ch2026_metrics_train.csv'
@@ -52,7 +55,7 @@ SUMMARY_DIR = OUTPUTS_DIR / 'summary'
 OOF_DIR     = OUTPUTS_DIR / 'oof'
 LOG_DIR     = OUTPUTS_DIR / 'log'
 
-EXP_TAG      = 'v21_ble_rssi_ambnight_seed12'
+EXP_TAG      = 'v23_stability_filter'
 OUTPUT_PATH  = OUTPUT_DIR  / f'submission_{EXP_TAG}.csv'
 RUN_LOG_PATH = LOG_DIR     / f'run_{EXP_TAG}.log'
 
@@ -609,6 +612,23 @@ def build_feature_table(train_df, sub_df):
     return train_full, test_full, feature_cols
 
 
+def compute_stability_scores(X, y, n_folds=5):
+    """5-fold LGB로 각 피처의 fold 간 중요도 일관성 측정."""
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    importances = []
+    for tr_idx, _ in skf.split(X, y):
+        m = lgb.LGBMClassifier(n_estimators=200, num_leaves=31, verbose=-1,
+                                n_jobs=-1, random_state=42)
+        m.fit(X.iloc[tr_idx], y[tr_idx])
+        imp = m.feature_importances_.astype(float)
+        imp /= (imp.sum() + 1e-10)
+        importances.append(imp)
+    importances = np.array(importances)                    # (n_folds, n_features)
+    nonzero_rate = (importances > 0).mean(axis=0)          # fold 중 비제로 비율
+    mean_imp     = importances.mean(axis=0)
+    return nonzero_rate, mean_imp
+
+
 def train_and_predict(train_full, test_full, feature_cols):
     X_train_base = train_full[feature_cols].copy()
     X_test_base  = test_full[feature_cols].copy()
@@ -626,6 +646,18 @@ def train_and_predict(train_full, test_full, feature_cols):
         y = train_full[target].values
         print(f'\n{"="*40}\n=== Target: {target} | pos_rate: {y.mean():.3f} ===\n{"="*40}')
 
+        # --- Stability filter: per-target feature selection ---
+        print(f'  [Stability] Computing feature stability scores...')
+        nonzero_rate, mean_imp = compute_stability_scores(X_train_base, y)
+        stable_idx = np.where(nonzero_rate >= STABILITY_THRESHOLD)[0]
+        stable_idx = stable_idx[np.argsort(mean_imp[stable_idx])[::-1]][:MAX_STABLE_FEATURES]
+        stable_cols = [feature_cols[i] for i in stable_idx]
+        if len(stable_cols) == 0:
+            stable_cols = feature_cols  # fallback: 전체 사용
+        X_train_use = X_train_base[stable_cols]
+        X_test_use  = X_test_base[stable_cols]
+        print(f'  [Stability] {len(feature_cols)} → {len(stable_cols)} features selected')
+
         # --- Optuna tuning (3-fold stratified, fast) ---
         print(f'  [Optuna] Searching Golden Parameters ({n_optuna_trials} trials/model)...')
         tune_skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
@@ -642,13 +674,13 @@ def train_and_predict(train_full, test_full, feature_cols):
             }
             if HAS_CUDA: params.update({'device':'gpu'})
             losses = []
-            for tr_idx, val_idx in tune_skf.split(X_train_base, y):
+            for tr_idx, val_idx in tune_skf.split(X_train_use, y):
                 m = lgb.LGBMClassifier(**params)
-                try: m.fit(X_train_base.iloc[tr_idx], y[tr_idx])
+                try: m.fit(X_train_use.iloc[tr_idx], y[tr_idx])
                 except:
                     params['device'] = 'cpu'; m = lgb.LGBMClassifier(**params)
-                    m.fit(X_train_base.iloc[tr_idx], y[tr_idx])
-                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_base.iloc[val_idx])[:,1]))
+                    m.fit(X_train_use.iloc[tr_idx], y[tr_idx])
+                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_use.iloc[val_idx])[:,1]))
             return np.mean(losses)
 
         def objective_xgb(trial):
@@ -662,10 +694,10 @@ def train_and_predict(train_full, test_full, feature_cols):
             }
             if HAS_CUDA: params.update({'tree_method':'hist','device':'cuda'})
             losses = []
-            for tr_idx, val_idx in tune_skf.split(X_train_base, y):
+            for tr_idx, val_idx in tune_skf.split(X_train_use, y):
                 m = xgb.XGBClassifier(**params)
-                m.fit(X_train_base.iloc[tr_idx], y[tr_idx], verbose=False)
-                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_base.iloc[val_idx])[:,1]))
+                m.fit(X_train_use.iloc[tr_idx], y[tr_idx], verbose=False)
+                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_use.iloc[val_idx])[:,1]))
             return np.mean(losses)
 
         def objective_cat(trial):
@@ -678,10 +710,10 @@ def train_and_predict(train_full, test_full, feature_cols):
             }
             if HAS_CUDA: params.update({'task_type':'GPU'})
             losses = []
-            for tr_idx, val_idx in tune_skf.split(X_train_base, y):
+            for tr_idx, val_idx in tune_skf.split(X_train_use, y):
                 m = CatBoostClassifier(**params)
-                m.fit(X_train_base.iloc[tr_idx], y[tr_idx])
-                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_base.iloc[val_idx])[:,1]))
+                m.fit(X_train_use.iloc[tr_idx], y[tr_idx])
+                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_use.iloc[val_idx])[:,1]))
             return np.mean(losses)
 
         study_lgb = optuna.create_study(direction='minimize'); study_lgb.optimize(objective_lgb, n_trials=n_optuna_trials)
@@ -720,10 +752,10 @@ def train_and_predict(train_full, test_full, feature_cols):
             s_test_xgb = np.zeros(len(X_test_base))
             s_test_cat = np.zeros(len(X_test_base))
 
-            for tr_idx, val_idx in skf.split(X_train_base, y):
-                X_tr  = X_train_base.iloc[tr_idx].copy()
-                X_val = X_train_base.iloc[val_idx].copy()
-                X_te  = X_test_base.copy()
+            for tr_idx, val_idx in skf.split(X_train_use, y):
+                X_tr  = X_train_use.iloc[tr_idx].copy()
+                X_val = X_train_use.iloc[val_idx].copy()
+                X_te  = X_test_use.copy()
                 y_tr, y_val = y[tr_idx], y[val_idx]
 
                 if USE_FOLD_SAFE_TE:

@@ -1,8 +1,7 @@
-# v22: v20 (Daytime HR) + BLE RSSI 피처 + Ambience 야간 피처 + 12-seed 앙상블
-#   - extract_ble: ble_strong_dev_count (rssi>-70), ble_mean_rssi, ble_night_unique 추가
-#   - extract_ambience: amb_night_speech (22시 이후 대화 비율) 추가
-#   - seeds 8 → 12로 확장 (분산 감소)
-#   - OOF 파일 저장 추가
+# v22b: v22a + Subject-Hole CV (StratifiedKFold → 인터리빙 구조 시뮬레이션)
+#   - v22a의 모든 피처 포함
+#   - make_subject_hole_folds: 피험자 내 초반/후반 날짜 모두 validation에 포함
+#   - Optuna 튜닝은 StratifiedKFold 유지 (속도), 메인 학습만 교체
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -18,7 +17,6 @@ import pandas as pd
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
-import torch
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss
 from sklearn.linear_model import LogisticRegression
@@ -38,7 +36,25 @@ if not (0 < PSEUDO_PUBLIC_TAIL_FRAC < 1):
     raise ValueError("V12_PSEUDO_TAIL_FRAC must be in (0, 1)")
 
 FORCE_CPU = os.environ.get('V12_FORCE_CPU', '0') == '1'
-HAS_CUDA  = (not FORCE_CPU) and torch.cuda.is_available() and torch.cuda.device_count() > 0
+
+def _cuda_available():
+    try:
+        import torch
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            return True
+    except ImportError:
+        pass
+    try:
+        import subprocess, shutil
+        if shutil.which('nvidia-smi'):
+            r = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+                               capture_output=True, text=True, timeout=5)
+            return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        pass
+    return False
+
+HAS_CUDA = (not FORCE_CPU) and _cuda_available()
 
 BASE_DIR   = Path(__file__).resolve().parent.parent
 DATA_DIR   = BASE_DIR / 'ch2025_data_items'
@@ -52,7 +68,7 @@ SUMMARY_DIR = OUTPUTS_DIR / 'summary'
 OOF_DIR     = OUTPUTS_DIR / 'oof'
 LOG_DIR     = OUTPUTS_DIR / 'log'
 
-EXP_TAG      = 'v21_ble_rssi_ambnight_seed12'
+EXP_TAG      = 'v22b_target_features_subjecthole'
 OUTPUT_PATH  = OUTPUT_DIR  / f'submission_{EXP_TAG}.csv'
 RUN_LOG_PATH = LOG_DIR     / f'run_{EXP_TAG}.log'
 
@@ -146,7 +162,7 @@ def extract_hr(df_raw, keys):
     for (sid, d), grp in df_day.groupby(['subject_id', 'date']):
         row = {'subject_id': sid, 'lifelog_date': d}
         all_hr = []
-        seg_hr = {'morn': [], 'aftn': [], 'eve': [], 'presleep': []}
+        seg_hr = {'morn': [], 'aftn': [], 'eve': [], 'presleep': [], 'presleep21': []}
         for ts, v in zip(grp['timestamp'], grp['heart_rate']):
             try:
                 arr = np.asarray(v, dtype=float).ravel()
@@ -155,10 +171,11 @@ def extract_hr(df_raw, keys):
                 arr = np.array([])
             all_hr.extend(arr.tolist())
             h = ts.hour
-            if   6 <= h < 12: seg_hr['morn'].extend(arr.tolist())
+            if   6 <= h < 12:  seg_hr['morn'].extend(arr.tolist())
             elif 12 <= h < 18: seg_hr['aftn'].extend(arr.tolist())
             elif 18 <= h < 22: seg_hr['eve'].extend(arr.tolist())
-            elif h >= 22:      seg_hr['presleep'].extend(arr.tolist())
+            elif 21 <= h < 23: seg_hr['presleep21'].extend(arr.tolist())
+            if h >= 22:        seg_hr['presleep'].extend(arr.tolist())
 
         hr = np.array(all_hr)
         hr = hr[hr > 0] if len(hr) > 0 else hr
@@ -171,20 +188,23 @@ def extract_hr(df_raw, keys):
         row['hr_day_n_records']      = len(grp)
         row['hr_day_rmssd']          = float(np.sqrt(np.nanmean(np.diff(hr)**2))) if len(hr) > 5 else np.nan
 
-        morn_arr = np.array(seg_hr['morn']); morn_arr = morn_arr[morn_arr > 0] if len(morn_arr) > 0 else morn_arr
-        aftn_arr = np.array(seg_hr['aftn']); aftn_arr = aftn_arr[aftn_arr > 0] if len(aftn_arr) > 0 else aftn_arr
-        eve_arr  = np.array(seg_hr['eve']);  eve_arr  = eve_arr[eve_arr > 0]   if len(eve_arr) > 0 else eve_arr
-        pre_arr  = np.array(seg_hr['presleep']); pre_arr = pre_arr[pre_arr > 0] if len(pre_arr) > 0 else pre_arr
+        morn_arr  = np.array(seg_hr['morn']);      morn_arr  = morn_arr[morn_arr > 0]   if len(morn_arr) > 0  else morn_arr
+        aftn_arr  = np.array(seg_hr['aftn']);      aftn_arr  = aftn_arr[aftn_arr > 0]   if len(aftn_arr) > 0  else aftn_arr
+        eve_arr   = np.array(seg_hr['eve']);       eve_arr   = eve_arr[eve_arr > 0]     if len(eve_arr) > 0   else eve_arr
+        pre_arr   = np.array(seg_hr['presleep']);  pre_arr   = pre_arr[pre_arr > 0]     if len(pre_arr) > 0   else pre_arr
+        pre21_arr = np.array(seg_hr['presleep21']); pre21_arr = pre21_arr[pre21_arr > 0] if len(pre21_arr) > 0 else pre21_arr
 
-        for seg, arr in [('morn',morn_arr),('aftn',aftn_arr),('eve',eve_arr),('presleep',pre_arr)]:
+        for seg, arr in [('morn',morn_arr),('aftn',aftn_arr),('eve',eve_arr),('presleep',pre_arr),('presleep21',pre21_arr)]:
             row[f'hr_{seg}_mean'] = np.nanmean(arr) if len(arr) > 0 else np.nan
             row[f'hr_{seg}_std']  = np.nanstd(arr)  if len(arr) > 0 else np.nan
 
-        morn_mean = np.nanmean(morn_arr) if len(morn_arr) > 0 else np.nan
-        eve_mean  = np.nanmean(eve_arr)  if len(eve_arr)  > 0 else np.nan
-        pre_mean  = np.nanmean(pre_arr)  if len(pre_arr)  > 0 else np.nan
-        row['hr_morn_eve_diff']     = morn_mean - eve_mean if not (np.isnan(morn_mean) or np.isnan(eve_mean)) else np.nan
-        row['hr_eve_presleep_diff'] = eve_mean - pre_mean  if not (np.isnan(eve_mean)  or np.isnan(pre_mean))  else np.nan
+        morn_mean  = np.nanmean(morn_arr)  if len(morn_arr) > 0  else np.nan
+        eve_mean   = np.nanmean(eve_arr)   if len(eve_arr) > 0   else np.nan
+        pre_mean   = np.nanmean(pre_arr)   if len(pre_arr) > 0   else np.nan
+        pre21_mean = np.nanmean(pre21_arr) if len(pre21_arr) > 0 else np.nan
+        row['hr_morn_eve_diff']      = morn_mean - eve_mean   if not (np.isnan(morn_mean)  or np.isnan(eve_mean))   else np.nan
+        row['hr_eve_presleep_diff']  = eve_mean  - pre_mean   if not (np.isnan(eve_mean)   or np.isnan(pre_mean))   else np.nan
+        row['hr_presleep21_vs_eve']  = pre21_mean - eve_mean  if not (np.isnan(pre21_mean) or np.isnan(eve_mean))   else np.nan
 
         feats.append(row)
 
@@ -261,26 +281,49 @@ def extract_gps(df_raw, keys):
         feats.append(row)
     return pd.DataFrame(feats)
 
+_SOCIAL_KEYWORDS = ['카카오톡','kakaotalk','카카오스토리','instagram','인스타그램',
+                    'line','라인','facebook','twitter','트위터','band','밴드']
+_VIDEO_KEYWORDS  = ['youtube','유튜브','netflix','넷플릭스','tving','왓챠','watchaplay',
+                    'wavve','웨이브','coupangplay','쿠팡플레이']
+
+def _is_social(name): n = name.lower().replace(' ',''); return any(k in n for k in _SOCIAL_KEYWORDS)
+def _is_video(name):  n = name.lower().replace(' ',''); return any(k in n for k in _VIDEO_KEYWORDS)
+
 def extract_usage(df_raw, keys):
     df_raw['date'] = df_raw['timestamp'].dt.normalize()
     feats = []
     for (sid, d), grp in df_raw.groupby(['subject_id', 'date']):
         row = {'subject_id': sid, 'lifelog_date': d}
         total_time = late_time = eve_time = n_apps = 0
+        social_total = social_presleep = video_total = video_presleep = 0
         for ts, v in zip(grp['timestamp'], grp['m_usage_stats']):
-            if isinstance(v, list):
-                for app in v:
-                    if isinstance(app, dict):
-                        t = app.get('total_time', 0) or 0
-                        total_time += t; n_apps += 1
-                        if ts.hour >= 22 or ts.hour < 2: late_time += t
-                        if ts.hour >= 18: eve_time += t
-        row['usage_total_time'] = total_time
-        row['usage_n_apps']     = n_apps
-        row['usage_late_time']  = late_time
-        row['usage_late_ratio'] = late_time / (total_time + 1)
-        row['usage_eve_time']   = eve_time
-        row['usage_eve_ratio']  = eve_time / (total_time + 1)
+            arr = v.tolist() if hasattr(v, 'tolist') else v
+            if not isinstance(arr, list): continue
+            for app in arr:
+                app = app.tolist() if hasattr(app, 'tolist') else app
+                if not isinstance(app, dict): continue
+                name = str(app.get('app_name', '') or '')
+                t = int(app.get('total_time', 0) or 0)
+                total_time += t; n_apps += 1
+                if ts.hour >= 22 or ts.hour < 2: late_time += t
+                if ts.hour >= 18: eve_time += t
+                if _is_social(name):
+                    social_total += t
+                    if 21 <= ts.hour < 23: social_presleep += t
+                if _is_video(name):
+                    video_total += t
+                    if 21 <= ts.hour < 23: video_presleep += t
+        row['usage_total_time']     = total_time
+        row['usage_n_apps']         = n_apps
+        row['usage_late_time']      = late_time
+        row['usage_late_ratio']     = late_time / (total_time + 1)
+        row['usage_eve_time']       = eve_time
+        row['usage_eve_ratio']      = eve_time / (total_time + 1)
+        row['usage_social_total']   = social_total
+        row['usage_social_ratio']   = social_total / (total_time + 1)
+        row['usage_social_presleep']= social_presleep
+        row['usage_video_total']    = video_total
+        row['usage_video_presleep'] = video_presleep
         feats.append(row)
     return pd.DataFrame(feats)
 
@@ -340,23 +383,45 @@ def extract_ambience(df_raw, keys):
     feats = []
     for (sid, d), grp in df_raw.groupby(['subject_id', 'date']):
         row = {'subject_id': sid, 'lifelog_date': d}
-        music_s, speech_s, silence_s = [], [], []
-        for v in grp['m_ambience']:
-            if isinstance(v, list):
-                dm = {item[0]: item[1] for item in v if isinstance(item, list) and len(item) == 2}
-                music_s.append(dm.get('Music', 0))
-                speech_s.append(dm.get('Speech', 0))
-                silence_s.append(dm.get('Silence', 0))
-        night_speech = []
+        day_bufs  = {k: [] for k in ['Music','Speech','Silence','Conversation','Vehicle','Indoor']}
+        pre_bufs  = {k: [] for k in ['Speech','Conversation','Vehicle','Indoor']}
+        night_bufs = {'Speech': []}
+
         for ts, v in zip(grp['timestamp'], grp['m_ambience']):
-            if ts.hour >= 22 and isinstance(v, list):
-                dm = {item[0]: item[1] for item in v if isinstance(item, list) and len(item) == 2}
-                night_speech.append(dm.get('Speech', 0))
-        row['amb_music_mean']   = np.mean(music_s)    if music_s    else np.nan
-        row['amb_speech_mean']  = np.mean(speech_s)   if speech_s   else np.nan
-        row['amb_silence_mean'] = np.mean(silence_s)  if silence_s  else np.nan
-        row['amb_night_speech'] = np.mean(night_speech) if night_speech else np.nan
-        row['amb_n_records']    = len(grp)
+            arr = v.tolist() if hasattr(v, 'tolist') else v
+            if not isinstance(arr, list): continue
+            dm = {}
+            for item in arr:
+                item = item.tolist() if hasattr(item, 'tolist') else item
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    try: dm[str(item[0])] = float(item[1])
+                    except: pass
+            music  = dm.get('Music', 0)
+            speech = dm.get('Speech', 0)
+            silence= dm.get('Silence', 0)
+            conv   = dm.get('Conversation', 0)
+            indoor = dm.get('Inside, small room', 0) + dm.get('Inside, large room or hall', 0) + dm.get('Inside, public space', 0)
+            vehicle= dm.get('Vehicle', 0) + dm.get('Motor vehicle (road)', 0) + dm.get('Car', 0)
+            day_bufs['Music'].append(music);   day_bufs['Speech'].append(speech)
+            day_bufs['Silence'].append(silence); day_bufs['Conversation'].append(conv)
+            day_bufs['Vehicle'].append(vehicle); day_bufs['Indoor'].append(indoor)
+            if 21 <= ts.hour < 23:
+                pre_bufs['Speech'].append(speech); pre_bufs['Conversation'].append(conv)
+                pre_bufs['Vehicle'].append(vehicle); pre_bufs['Indoor'].append(indoor)
+            if ts.hour >= 22:
+                night_bufs['Speech'].append(speech)
+
+        row['amb_music_mean']          = np.mean(day_bufs['Music'])    if day_bufs['Music']    else np.nan
+        row['amb_speech_mean']         = np.mean(day_bufs['Speech'])   if day_bufs['Speech']   else np.nan
+        row['amb_silence_mean']        = np.mean(day_bufs['Silence'])  if day_bufs['Silence']  else np.nan
+        row['amb_conv_mean']           = np.mean(day_bufs['Conversation']) if day_bufs['Conversation'] else np.nan
+        row['amb_vehicle_mean']        = np.mean(day_bufs['Vehicle'])  if day_bufs['Vehicle']  else np.nan
+        row['amb_indoor_mean']         = np.mean(day_bufs['Indoor'])   if day_bufs['Indoor']   else np.nan
+        row['amb_presleep_conv']       = np.mean(pre_bufs['Conversation']) if pre_bufs['Conversation'] else np.nan
+        row['amb_presleep_vehicle']    = np.mean(pre_bufs['Vehicle'])  if pre_bufs['Vehicle']  else np.nan
+        row['amb_presleep_indoor']     = np.mean(pre_bufs['Indoor'])   if pre_bufs['Indoor']   else np.nan
+        row['amb_night_speech']        = np.mean(night_bufs['Speech']) if night_bufs['Speech'] else np.nan
+        row['amb_n_records']           = len(grp)
         feats.append(row)
     return pd.DataFrame(feats)
 
@@ -503,6 +568,29 @@ def build_pseudo_public_mask(df, tail_frac):
         mask.loc[grp.index[-tail_n:]] = True
     return mask.values
 
+def make_subject_hole_folds(train_df, n_folds=5):
+    """각 피험자 내 초반/후반 날짜가 모두 validation에 포함되도록 fold 생성.
+    테스트 세트의 인터리빙 구조(train과 test 날짜가 교대 배치)를 시뮬레이션."""
+    all_idx = train_df.index.to_numpy()
+    block_count = n_folds * 2
+    by_subject = {}
+    for sid, grp in train_df.sort_values(['subject_id', 'lifelog_date']).groupby('subject_id'):
+        chunks = [c for c in np.array_split(grp.index.to_numpy(), block_count) if len(c)]
+        by_subject[str(sid)] = chunks
+    folds = []
+    for fold_id in range(n_folds):
+        val_parts = []
+        for chunks in by_subject.values():
+            for hole_id in (fold_id, fold_id + n_folds):
+                if hole_id < len(chunks):
+                    val_parts.append(chunks[hole_id])
+        if not val_parts: continue
+        val_idx = np.concatenate(val_parts)
+        tr_idx  = np.setdiff1d(all_idx, val_idx, assume_unique=False)
+        if len(tr_idx) and len(val_idx):
+            folds.append((tr_idx, val_idx))
+    return folds
+
 def build_feature_table(train_df, sub_df):
     all_keys = pd.concat([train_df[['subject_id','lifelog_date']],
                           sub_df[['subject_id','lifelog_date']]]).drop_duplicates().reset_index(drop=True)
@@ -553,6 +641,9 @@ def build_feature_table(train_df, sub_df):
         feat_all['screen_per_step'] = feat_all['screen_on_total'] / (feat_all['pedo_total_steps'] + 1)
     if 'pedo_total_calories' in feat_all.columns and 'usage_total_time' in feat_all.columns:
         feat_all['cal_per_usage'] = feat_all['pedo_total_calories'] / (feat_all['usage_total_time'] + 1)
+    # 취침 전 HR 각성 수준: presleep21 HR - 저녁 HR (Q2/Q3 스트레스 직결)
+    if 'hr_presleep21_mean' in feat_all.columns and 'hr_eve_mean' in feat_all.columns:
+        feat_all['hr_presleep_elevation'] = feat_all['hr_presleep21_mean'] - feat_all['hr_eve_mean']
 
     feat_all = feat_all.sort_values(['subject_id','lifelog_date']).reset_index(drop=True)
 
@@ -563,6 +654,9 @@ def build_feature_table(train_df, sub_df):
         'gps_moving_ratio','usage_late_ratio','usage_eve_ratio','ac_presleep_charging',
         'hr_day_mean','hr_day_rmssd','hr_eve_mean','hr_presleep_mean',
         'ble_strong_dev_count','amb_night_speech',
+        'hr_presleep21_mean','hr_presleep_elevation',
+        'amb_presleep_conv','amb_conv_mean','amb_vehicle_mean',
+        'usage_social_total','usage_social_presleep','usage_video_presleep',
     ]
     for col in roll_cols:
         if col not in feat_all.columns: continue
@@ -702,8 +796,8 @@ def train_and_predict(train_full, test_full, feature_cols):
         else:
             best_lgb.update({'device':'cpu'})
 
-        # --- L0: 12-seed StratifiedKFold ensemble ---
-        print(f'  [L0] Training {len(seeds)}-seed ensemble...')
+        # --- L0: 12-seed Subject-Hole CV ensemble ---
+        print(f'  [L0] Training {len(seeds)}-seed ensemble (Subject-Hole CV)...')
         oof_lgb  = np.zeros(len(X_train_base))
         oof_xgb  = np.zeros(len(X_train_base))
         oof_cat  = np.zeros(len(X_train_base))
@@ -711,8 +805,8 @@ def train_and_predict(train_full, test_full, feature_cols):
         test_xgb = np.zeros(len(X_test_base))
         test_cat = np.zeros(len(X_test_base))
 
+        hole_folds = make_subject_hole_folds(train_full, n_folds)
         for seed in seeds:
-            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
             s_oof_lgb  = np.zeros(len(X_train_base))
             s_oof_xgb  = np.zeros(len(X_train_base))
             s_oof_cat  = np.zeros(len(X_train_base))
@@ -720,7 +814,7 @@ def train_and_predict(train_full, test_full, feature_cols):
             s_test_xgb = np.zeros(len(X_test_base))
             s_test_cat = np.zeros(len(X_test_base))
 
-            for tr_idx, val_idx in skf.split(X_train_base, y):
+            for tr_idx, val_idx in hole_folds:
                 X_tr  = X_train_base.iloc[tr_idx].copy()
                 X_val = X_train_base.iloc[val_idx].copy()
                 X_te  = X_test_base.copy()
@@ -775,9 +869,7 @@ def train_and_predict(train_full, test_full, feature_cols):
         X_meta_te = np.column_stack([test_lgb, test_xgb, test_cat])
         meta_oof  = np.zeros(len(X_train_base))
         meta_test = np.zeros(len(X_test_base))
-        meta_skf  = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-
-        for meta_tr_idx, meta_val_idx in meta_skf.split(X_meta_tr, y):
+        for meta_tr_idx, meta_val_idx in hole_folds:
             mm = LogisticRegression(**meta_params)
             mm.fit(X_meta_tr[meta_tr_idx], y[meta_tr_idx])
             meta_oof[meta_val_idx]  = mm.predict_proba(X_meta_tr[meta_val_idx])[:, 1]
