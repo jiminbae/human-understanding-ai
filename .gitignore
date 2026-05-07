@@ -61,3 +61,4 @@ jimin/summary/
 jimin/report_v*.txt
 jimin/submission_v*.csv
 jimin/summary_v*.json
+jimin/model_context_for_ppt.md
