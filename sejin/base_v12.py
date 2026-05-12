@@ -734,7 +734,8 @@ def _train_pass(train_full, test_full, feature_cols,
     seeds           = seed_pool[:max(1, min(n_seed_limit, len(seed_pool)))]
     n_folds         = 5
     n_optuna_trials = int(os.environ.get('V29_OPTUNA_TRIALS', '50'))
-    te_windows      = [3, 7, 14, 21]
+    te_windows      = [3, 7, 14, 21, 30, 45, 60]
+
 
     oof_preds  = np.zeros((len(X_train_base), len(TARGETS)))
     test_preds = np.zeros((len(X_test_base),  len(TARGETS)))
