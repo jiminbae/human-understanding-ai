@@ -1,8 +1,7 @@
-# v30: v29 + extended bidirectional target history encoding
-#   - v23 stability-filtered LGB/XGB/CAT stack을 유지
-#   - subject별 train label이 test block 앞뒤에 존재하는 구조를 활용
-#   - fold 내부에서는 validation label을 history에서 제외해 OOF leakage 방지
-#   - test 예측에서는 전체 train label의 past/future history를 사용
+# v33: long-history cross-target chaining + conservative policy candidates
+#   - sejin/base_v12의 핵심 신호인 long target-history windows를 jimin 파이프라인에 이식
+#   - Pass1 독립 예측과 Pass2 cross-target chaining 예측을 모두 저장
+#   - raw Pass2 외에 v32 anchor와 보수 blend 후보를 함께 생성
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -29,7 +28,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 TARGETS = ['Q1', 'Q2', 'Q3', 'S1', 'S2', 'S3', 'S4']
 USE_TRAIN_SUBJ_NORM    = os.environ.get('V12_TRAIN_NORM',      '0') == '1'
 USE_FOLD_SAFE_TE       = os.environ.get('V12_FOLD_SAFE_TE',    '1') == '1'
-USE_BIDIRECTIONAL_TE   = os.environ.get('V30_BIDIR_TE',        '1') == '1'
+USE_BIDIRECTIONAL_TE   = os.environ.get('V29_BIDIR_TE',        '1') == '1'
 USE_CALIBRATION        = os.environ.get('V12_CALIBRATION',     '0') == '1'
 CALIBRATION_METHOD     = os.environ.get('V12_CALIB_METHOD', 'platt').strip().lower()
 if CALIBRATION_METHOD not in {'platt', 'isotonic'}:
@@ -43,6 +42,7 @@ HAS_CUDA  = (not FORCE_CPU) and torch.cuda.is_available() and torch.cuda.device_
 
 STABILITY_THRESHOLD = float(os.environ.get('V23_STAB_THRESHOLD', '0.6'))
 MAX_STABLE_FEATURES = int(os.environ.get('V23_MAX_FEATURES', '150'))
+USE_CROSS_TARGET    = os.environ.get('V33_CROSS_TARGET', os.environ.get('V30_CROSS_TARGET', '1')) == '1'
 
 BASE_DIR   = Path(__file__).resolve().parent.parent
 DATA_DIR   = BASE_DIR / 'ch2025_data_items'
@@ -56,9 +56,18 @@ SUMMARY_DIR = OUTPUTS_DIR / 'summary'
 OOF_DIR     = OUTPUTS_DIR / 'oof'
 LOG_DIR     = OUTPUTS_DIR / 'log'
 
-EXP_TAG      = os.environ.get('V30_EXP_TAG', 'v30_bidir_history_extended')
-OUTPUT_PATH  = OUTPUT_DIR  / f'submission_{EXP_TAG}.csv'
+EXP_TAG      = os.environ.get('V33_EXP_TAG', 'v33_long_history_cross_target')
 RUN_LOG_PATH = LOG_DIR     / f'run_{EXP_TAG}.log'
+V32_SUB_PATH = OUTPUT_DIR / 'submission_v32_target_specialized_bidir_s2w0p675.csv'
+V32_OOF_PATH = OOF_DIR / 'oof_v32_target_specialized_bidir_s2w0p675.csv'
+
+
+def parse_windows():
+    raw = os.environ.get('V33_TE_WINDOWS', '3,7,14,21,30,45,60')
+    windows = [int(x.strip()) for x in raw.split(',') if x.strip()]
+    if not windows:
+        raise ValueError('V33_TE_WINDOWS must contain at least one integer window')
+    return sorted(set(windows))
 
 
 class Tee:
@@ -487,22 +496,16 @@ def _encode_bidirectional_from_history(history_map, query_df, windows):
     for sid, d in query_df[['subject_id','lifelog_date']].itertuples(index=False):
         row = {
             'te_next1': np.nan,
-            'te_prev1_next1_mean': np.nan,
-            'te_prev1_next1_gap': np.nan,
-            'te_prev_next_invw': np.nan,
             'te_prev_dist': np.nan,
             'te_next_dist': np.nan,
             'te_has_left': 0.0,
             'te_has_right': 0.0,
         }
         for w in windows:
-            row[f'te_past_cnt{w}'] = 0.0
-            row[f'te_fwd_cnt{w}'] = 0.0
             row[f'te_fwd_enc{w}'] = np.nan
             row[f'te_bidir_mean{w}'] = np.nan
             row[f'te_bidir_gap{w}'] = np.nan
             row[f'te_bidir_agree{w}'] = np.nan
-            row[f'te_bidir_invw{w}'] = np.nan
 
         if sid not in history_map:
             rows.append(row)
@@ -523,22 +526,12 @@ def _encode_bidirectional_from_history(history_map, query_df, windows):
             row['te_has_right'] = 1.0
             row['te_next1'] = future_labels[0]
             row['te_next_dist'] = float((dates[right] - d64) / np.timedelta64(1, 'D'))
-        if len(past_labels) > 0 and len(future_labels) > 0:
-            prev1 = past_labels[-1]
-            next1 = future_labels[0]
-            row['te_prev1_next1_mean'] = 0.5 * (prev1 + next1)
-            row['te_prev1_next1_gap'] = next1 - prev1
-            left_w = 1.0 / (row['te_prev_dist'] + 1.0)
-            right_w = 1.0 / (row['te_next_dist'] + 1.0)
-            row['te_prev_next_invw'] = (prev1 * left_w + next1 * right_w) / (left_w + right_w)
 
         for w in windows:
             past_mask = dates[:left] >= d64 - np.timedelta64(w, 'D')
             future_mask = dates[right:] <= d64 + np.timedelta64(w, 'D')
             past_win = past_labels[past_mask]
             future_win = future_labels[future_mask]
-            row[f'te_past_cnt{w}'] = float(len(past_win))
-            row[f'te_fwd_cnt{w}'] = float(len(future_win))
 
             past_mean = np.nanmean(past_win) if len(past_win) > 0 else np.nan
             future_mean = np.nanmean(future_win) if len(future_win) > 0 else np.nan
@@ -548,17 +541,10 @@ def _encode_bidirectional_from_history(history_map, query_df, windows):
                 row[f'te_bidir_mean{w}'] = 0.5 * (past_mean + future_mean)
                 row[f'te_bidir_gap{w}'] = future_mean - past_mean
                 row[f'te_bidir_agree{w}'] = float(round(past_mean) == round(future_mean))
-                left_w = 1.0 / (row['te_prev_dist'] + 1.0) if row['te_has_left'] else 0.0
-                right_w = 1.0 / (row['te_next_dist'] + 1.0) if row['te_has_right'] else 0.0
-                row[f'te_bidir_invw{w}'] = (
-                    (past_mean * left_w + future_mean * right_w) / (left_w + right_w + 1e-12)
-                )
             elif not np.isnan(future_mean):
                 row[f'te_bidir_mean{w}'] = future_mean
-                row[f'te_bidir_invw{w}'] = future_mean
             elif not np.isnan(past_mean):
                 row[f'te_bidir_mean{w}'] = past_mean
-                row[f'te_bidir_invw{w}'] = past_mean
 
         rows.append(row)
     return pd.DataFrame(rows, index=query_df.index)
@@ -735,24 +721,32 @@ def compute_stability_scores(X, y, n_folds=5):
     return nonzero_rate, mean_imp
 
 
-def train_and_predict(train_full, test_full, feature_cols):
+def _train_pass(train_full, test_full, feature_cols,
+                cross_oof=None, cross_test=None, pass_label=''):
+    """단일 학습 패스.
+
+    cross_oof  : shape (n_train, len(TARGETS)) — Pass1 OOF 예측. None이면 사용 안 함.
+    cross_test : shape (n_test,  len(TARGETS)) — Pass1 test 예측. None이면 사용 안 함.
+    pass_label : 로그 출력용 레이블 ('Pass1' / 'Pass2').
+    """
     X_train_base = train_full[feature_cols].copy()
     X_test_base  = test_full[feature_cols].copy()
 
     meta_params     = {'penalty': 'l2', 'C': 1.0, 'solver': 'lbfgs', 'max_iter': 1000}
     seed_pool       = [42, 1234, 9999, 7, 314, 2025, 777, 555, 2077, 1337, 99, 1111]
-    n_seed_limit    = int(os.environ.get('V30_N_SEEDS', str(len(seed_pool))))
+    n_seed_limit    = int(os.environ.get('V29_N_SEEDS', str(len(seed_pool))))
     seeds           = seed_pool[:max(1, min(n_seed_limit, len(seed_pool)))]
     n_folds         = 5
-    n_optuna_trials = int(os.environ.get('V30_OPTUNA_TRIALS', '50'))
-    te_windows      = [1, 3, 7, 14, 21, 28]
+    n_optuna_trials = int(os.environ.get('V33_OPTUNA_TRIALS', os.environ.get('V29_OPTUNA_TRIALS', '50')))
+    te_windows      = parse_windows()
+
 
     oof_preds  = np.zeros((len(X_train_base), len(TARGETS)))
     test_preds = np.zeros((len(X_test_base),  len(TARGETS)))
 
     for ti, target in enumerate(TARGETS):
         y = train_full[target].values
-        print(f'\n{"="*40}\n=== Target: {target} | pos_rate: {y.mean():.3f} ===\n{"="*40}')
+        print(f'\n{"="*40}\n=== [{pass_label}] Target: {target} | pos_rate: {y.mean():.3f} ===\n{"="*40}')
 
         # --- Stability filter: per-target feature selection ---
         print(f'  [Stability] Computing feature stability scores...')
@@ -762,9 +756,25 @@ def train_and_predict(train_full, test_full, feature_cols):
         stable_cols = [feature_cols[i] for i in stable_idx]
         if len(stable_cols) == 0:
             stable_cols = feature_cols  # fallback: 전체 사용
-        X_train_use = X_train_base[stable_cols]
-        X_test_use  = X_test_base[stable_cols]
+        X_train_use = X_train_base[stable_cols].reset_index(drop=True)
+        X_test_use  = X_test_base[stable_cols].reset_index(drop=True)
         print(f'  [Stability] {len(feature_cols)} → {len(stable_cols)} features selected')
+
+        # --- [v33] Cross-target OOF 피처 준비 (Pass2에서만 사용) ---
+        # 현재 타겟(ti)을 제외한 나머지 6개 타겟의 OOF/test 예측값을 피처로 추가.
+        # Optuna 튜닝 단계에도 동일하게 반영해 일관성 유지.
+        other_ti     = [i for i in range(len(TARGETS)) if i != ti]
+        cross_cols   = [f'cross_oof_{TARGETS[i]}' for i in other_ti]
+        has_cross    = (cross_oof is not None) and (cross_test is not None)
+
+        if has_cross:
+            cross_tr_full = pd.DataFrame(cross_oof[:, other_ti],  columns=cross_cols)
+            cross_te_full = pd.DataFrame(cross_test[:, other_ti], columns=cross_cols)
+            # Optuna 튜닝에 쓸 전체 feature matrix (TE 없이, cross 포함)
+            X_tune_use = pd.concat([X_train_use, cross_tr_full], axis=1)
+            print(f'  [v33] Cross-target features added: {cross_cols}')
+        else:
+            X_tune_use = X_train_use
 
         # --- Optuna tuning (3-fold stratified, fast) ---
         print(f'  [Optuna] Searching Golden Parameters ({n_optuna_trials} trials/model)...')
@@ -782,13 +792,13 @@ def train_and_predict(train_full, test_full, feature_cols):
             }
             if HAS_CUDA: params.update({'device':'gpu'})
             losses = []
-            for tr_idx, val_idx in tune_skf.split(X_train_use, y):
+            for tr_idx, val_idx in tune_skf.split(X_tune_use, y):
                 m = lgb.LGBMClassifier(**params)
-                try: m.fit(X_train_use.iloc[tr_idx], y[tr_idx])
+                try: m.fit(X_tune_use.iloc[tr_idx], y[tr_idx])
                 except:
                     params['device'] = 'cpu'; m = lgb.LGBMClassifier(**params)
-                    m.fit(X_train_use.iloc[tr_idx], y[tr_idx])
-                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_use.iloc[val_idx])[:,1]))
+                    m.fit(X_tune_use.iloc[tr_idx], y[tr_idx])
+                losses.append(log_loss(y[val_idx], m.predict_proba(X_tune_use.iloc[val_idx])[:,1]))
             return np.mean(losses)
 
         def objective_xgb(trial):
@@ -802,10 +812,10 @@ def train_and_predict(train_full, test_full, feature_cols):
             }
             if HAS_CUDA: params.update({'tree_method':'hist','device':'cuda'})
             losses = []
-            for tr_idx, val_idx in tune_skf.split(X_train_use, y):
+            for tr_idx, val_idx in tune_skf.split(X_tune_use, y):
                 m = xgb.XGBClassifier(**params)
-                m.fit(X_train_use.iloc[tr_idx], y[tr_idx], verbose=False)
-                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_use.iloc[val_idx])[:,1]))
+                m.fit(X_tune_use.iloc[tr_idx], y[tr_idx], verbose=False)
+                losses.append(log_loss(y[val_idx], m.predict_proba(X_tune_use.iloc[val_idx])[:,1]))
             return np.mean(losses)
 
         def objective_cat(trial):
@@ -818,10 +828,10 @@ def train_and_predict(train_full, test_full, feature_cols):
             }
             if HAS_CUDA: params.update({'task_type':'GPU'})
             losses = []
-            for tr_idx, val_idx in tune_skf.split(X_train_use, y):
+            for tr_idx, val_idx in tune_skf.split(X_tune_use, y):
                 m = CatBoostClassifier(**params)
-                m.fit(X_train_use.iloc[tr_idx], y[tr_idx])
-                losses.append(log_loss(y[val_idx], m.predict_proba(X_train_use.iloc[val_idx])[:,1]))
+                m.fit(X_tune_use.iloc[tr_idx], y[tr_idx])
+                losses.append(log_loss(y[val_idx], m.predict_proba(X_tune_use.iloc[val_idx])[:,1]))
             return np.mean(losses)
 
         study_lgb = optuna.create_study(direction='minimize'); study_lgb.optimize(objective_lgb, n_trials=n_optuna_trials)
@@ -877,6 +887,17 @@ def train_and_predict(train_full, test_full, feature_cols):
                     X_tr  = pd.concat([X_tr.reset_index(drop=True),  tr_te.reset_index(drop=True)],  axis=1)
                     X_val = pd.concat([X_val.reset_index(drop=True), val_te.reset_index(drop=True)],  axis=1)
                     X_te  = pd.concat([X_te.reset_index(drop=True),  test_te.reset_index(drop=True)], axis=1)
+
+                # --- [v33] fold 내부 cross-target 피처 주입 ---
+                # tr_idx/val_idx로 슬라이싱해 leakage 없이 추가.
+                # test에는 Pass1의 전체 test 예측(cross_te_full)을 사용.
+                if has_cross:
+                    ct_tr  = cross_tr_full.iloc[tr_idx].reset_index(drop=True)
+                    ct_val = cross_tr_full.iloc[val_idx].reset_index(drop=True)
+                    ct_te  = cross_te_full.reset_index(drop=True)
+                    X_tr  = pd.concat([X_tr.reset_index(drop=True),  ct_tr],  axis=1)
+                    X_val = pd.concat([X_val.reset_index(drop=True), ct_val], axis=1)
+                    X_te  = pd.concat([X_te.reset_index(drop=True),  ct_te],  axis=1)
 
                 m_lgb = lgb.LGBMClassifier(**{**best_lgb, 'random_state': seed})
                 m_xgb = xgb.XGBClassifier(**{**best_xgb, 'random_state': seed})
@@ -935,13 +956,142 @@ def train_and_predict(train_full, test_full, feature_cols):
     return oof_preds, test_preds
 
 
+def train_and_predict(train_full, test_full, feature_cols):
+    """2-pass cross-target chaining.
+
+    Pass 1: 7개 타겟 독립 학습 → OOF/test 예측 획득.
+    Pass 2: 각 타겟 학습 시 나머지 6개 타겟의 Pass1 OOF를 추가 피처로 사용.
+            Q1↔Q2↔Q3↔S1~S4 간의 강한 상관관계를 모델이 직접 활용하도록 함.
+
+    USE_CROSS_TARGET=0 이면 Pass1만 수행 (v29와 동일 동작).
+    """
+    print(f'\n{"#"*55}')
+    print(f'# Pass 1 — Base predictions (cross_oof=None)')
+    print(f'{"#"*55}')
+    oof_pass1, test_pass1 = _train_pass(
+        train_full, test_full, feature_cols,
+        cross_oof=None, cross_test=None, pass_label='Pass1'
+    )
+
+    # Pass1 OOF per-target 출력
+    for i, t in enumerate(TARGETS):
+        y = train_full[t].values
+        print(f'  [Pass1 OOF] {t}: {log_loss(y, oof_pass1[:, i]):.4f}')
+
+    if not USE_CROSS_TARGET:
+        print('[v33] USE_CROSS_TARGET=0 → Pass2 생략, Pass1 결과 반환')
+        return {
+            'pass1': (oof_pass1, test_pass1),
+            'final': (oof_pass1, test_pass1),
+        }
+
+    print(f'\n{"#"*55}')
+    print(f'# Pass 2 — Cross-target chaining (cross_oof=Pass1 OOF)')
+    print(f'{"#"*55}')
+    oof_pass2, test_pass2 = _train_pass(
+        train_full, test_full, feature_cols,
+        cross_oof=oof_pass1, cross_test=test_pass1, pass_label='Pass2'
+    )
+
+    print(f'\n[v33] Pass1 vs Pass2 OOF 비교:')
+    for i, t in enumerate(TARGETS):
+        y = train_full[t].values
+        p1 = log_loss(y, oof_pass1[:, i])
+        p2 = log_loss(y, oof_pass2[:, i])
+        delta = p2 - p1
+        arrow = '↓ 개선' if delta < 0 else ('↑ 악화' if delta > 0.0005 else '→ 유지')
+        print(f'  {t}: Pass1={p1:.4f} → Pass2={p2:.4f}  ({delta:+.4f} {arrow})')
+
+    return {
+        'pass1': (oof_pass1, test_pass1),
+        'pass2': (oof_pass2, test_pass2),
+        'final': (oof_pass2, test_pass2),
+    }
+
+
+def _prediction_frame(keys, preds):
+    out = keys.copy()
+    for i, target in enumerate(TARGETS):
+        out[target] = np.clip(preds[:, i], 0.02, 0.98)
+    return out
+
+
+def _evaluate_prediction_frame(train_full, oof_df):
+    per_target = {
+        t: log_loss(train_full[t].values, np.clip(oof_df[t].values, 1e-7, 1 - 1e-7))
+        for t in TARGETS
+    }
+    return float(np.mean(list(per_target.values()))), per_target
+
+
+def _pseudo_public_scores(train_full, oof_df):
+    pseudo_mask = build_pseudo_public_mask(
+        train_full[['subject_id', 'lifelog_date']], PSEUDO_PUBLIC_TAIL_FRAC)
+    pseudo_per_target = {
+        t: log_loss(
+            train_full.loc[pseudo_mask, t].values,
+            np.clip(oof_df.loc[pseudo_mask, t].values, 1e-7, 1 - 1e-7))
+        for t in TARGETS
+    }
+    return float(np.mean(list(pseudo_per_target.values()))), pseudo_per_target
+
+
+def _load_optional_frame(path):
+    if not path.exists():
+        print(f'[v33] Optional anchor missing, skip blends: {path}')
+        return None
+    df = pd.read_csv(path)
+    for col in ['lifelog_date', 'sleep_date']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col])
+    return df
+
+
+def _blend_frames(keys, left, right, weights):
+    out = keys.copy()
+    for target in TARGETS:
+        w = weights[target]
+        out[target] = np.clip(w * left[target].values + (1.0 - w) * right[target].values, 0.02, 0.98)
+    return out
+
+
+def _save_candidate(name, train_full, oof_df, sub_pred_df):
+    oof_total, per_target = _evaluate_prediction_frame(train_full, oof_df)
+    pseudo_total, pseudo_per_target = _pseudo_public_scores(train_full, oof_df)
+
+    oof_path = OOF_DIR / f'oof_{name}.csv'
+    sub_path = OUTPUT_DIR / f'submission_{name}.csv'
+    oof_df.to_csv(oof_path, index=False)
+    sub_pred_df.to_csv(sub_path, index=False)
+
+    print(f'\n{name} Total OOF:          {oof_total:.6f}')
+    print(f'{name} Pseudo-public OOF:  {pseudo_total:.6f}')
+    for target in TARGETS:
+        print(f'  {target}: OOF={per_target[target]:.6f}  pseudo={pseudo_per_target[target]:.6f}')
+    print(f'oof saved: {oof_path}')
+    print(f'submission saved: {sub_path}')
+
+    means = {target: float(sub_pred_df[target].mean()) for target in TARGETS}
+    return {
+        'name': name,
+        'oof': oof_total,
+        'pseudo_public_oof': pseudo_total,
+        'per_target': per_target,
+        'pseudo_per_target': pseudo_per_target,
+        'submission': str(sub_path),
+        'oof_path': str(oof_path),
+        'means': means,
+    }
+
+
 def main():
     ensure_dirs()
     log_f = open(RUN_LOG_PATH, 'w', encoding='utf-8')
     sys.stdout = Tee(sys.stdout, log_f)
 
     print(f'Starting {EXP_TAG}...')
-    print(f'  BIDIR_TE={USE_BIDIRECTIONAL_TE}  MAX_STABLE_FEATURES={MAX_STABLE_FEATURES}')
+    print(f'  BIDIR_TE={USE_BIDIRECTIONAL_TE}  MAX_STABLE_FEATURES={MAX_STABLE_FEATURES}  CROSS_TARGET={USE_CROSS_TARGET}')
+    print(f'  TE_WINDOWS={parse_windows()}')
     train_df = pd.read_csv(TRAIN_PATH)
     sub_df   = pd.read_csv(SUB_PATH)
     for df in [train_df, sub_df]:
@@ -949,36 +1099,52 @@ def main():
         df['sleep_date']   = pd.to_datetime(df['sleep_date'])
 
     train_full, test_full, feature_cols = build_feature_table(train_df, sub_df)
-    oof_preds, test_preds = train_and_predict(train_full, test_full, feature_cols)
+    pred_sets = train_and_predict(train_full, test_full, feature_cols)
 
-    per_target = {t: log_loss(train_full[t].values, oof_preds[:, i])
-                  for i, t in enumerate(TARGETS)}
-    oof_total = float(np.mean(list(per_target.values())))
+    train_keys = train_full[['subject_id','sleep_date','lifelog_date']].copy()
+    sub_keys = sub_df[['subject_id','sleep_date','lifelog_date']].copy()
 
-    pseudo_mask = build_pseudo_public_mask(train_full[['subject_id','lifelog_date']], PSEUDO_PUBLIC_TAIL_FRAC)
-    pseudo_per_target = {t: log_loss(train_full.loc[pseudo_mask, t].values, oof_preds[pseudo_mask, i])
-                         for i, t in enumerate(TARGETS)}
-    pseudo_oof_total = float(np.mean(list(pseudo_per_target.values())))
+    summaries = []
+    frame_sets = {}
+    for label, (oof_preds, test_preds) in pred_sets.items():
+        oof_df = _prediction_frame(train_keys, oof_preds)
+        sub_pred_df = _prediction_frame(sub_keys, test_preds)
+        frame_sets[label] = (oof_df, sub_pred_df)
+        candidate_name = EXP_TAG if label == 'final' else f'{EXP_TAG}_{label}'
+        summaries.append(_save_candidate(candidate_name, train_full, oof_df, sub_pred_df))
 
-    print(f'\n{"="*55}')
-    print(f'{EXP_TAG} Total OOF:          {oof_total:.4f}')
-    print(f'{EXP_TAG} Pseudo-public OOF:  {pseudo_oof_total:.4f}')
-    print(f'{"="*55}')
-    for t in TARGETS:
-        print(f'  {t}: OOF={per_target[t]:.4f}  pseudo={pseudo_per_target[t]:.4f}')
+    final_oof, final_sub = frame_sets['final']
+    v32_oof = _load_optional_frame(V32_OOF_PATH)
+    v32_sub = _load_optional_frame(V32_SUB_PATH)
 
-    oof_df = train_full[['subject_id','sleep_date','lifelog_date']].copy()
-    for i, t in enumerate(TARGETS):
-        oof_df[t] = oof_preds[:, i]
-    oof_path = OOF_DIR / f'oof_{EXP_TAG}.csv'
-    oof_df.to_csv(oof_path, index=False)
-    print(f'oof saved: {oof_path}')
+    if v32_oof is not None and v32_sub is not None:
+        blend_specs = {
+            f'{EXP_TAG}_v32blend95': {target: 0.95 for target in TARGETS},
+            f'{EXP_TAG}_v32blend90': {target: 0.90 for target in TARGETS},
+            f'{EXP_TAG}_target_safe': {
+                'Q1': 0.95, 'Q2': 0.95, 'Q3': 0.95,
+                'S1': 0.70, 'S2': 0.65, 'S3': 0.70, 'S4': 0.95,
+            },
+            f'{EXP_TAG}_target_mid': {
+                'Q1': 0.90, 'Q2': 0.95, 'Q3': 0.90,
+                'S1': 0.80, 'S2': 0.75, 'S3': 0.80, 'S4': 0.95,
+            },
+        }
+        for name, weights in blend_specs.items():
+            blend_oof = _blend_frames(train_keys, final_oof, v32_oof, weights)
+            blend_sub = _blend_frames(sub_keys, final_sub, v32_sub, weights)
+            summaries.append(_save_candidate(name, train_full, blend_oof, blend_sub))
 
-    submission = sub_df[['subject_id','sleep_date','lifelog_date']].copy()
-    for i, t in enumerate(TARGETS):
-        submission[t] = test_preds[:, i].clip(0.02, 0.98)
-    submission.to_csv(OUTPUT_PATH, index=False)
-    print(f'submission saved: {OUTPUT_PATH}')
+    summary_path = SUMMARY_DIR / f'summary_{EXP_TAG}.json'
+    summary_path.write_text(json.dumps({
+        'exp_tag': EXP_TAG,
+        'te_windows': parse_windows(),
+        'use_cross_target': USE_CROSS_TARGET,
+        'v32_oof_anchor': str(V32_OOF_PATH),
+        'v32_submission_anchor': str(V32_SUB_PATH),
+        'candidates': summaries,
+    }, indent=2), encoding='utf-8')
+    print(f'\nsummary saved: {summary_path}')
     log_f.close()
 
 if __name__ == '__main__':
