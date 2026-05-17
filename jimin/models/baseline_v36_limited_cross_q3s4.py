@@ -1,7 +1,8 @@
-# v36: limited cross-target retraining for the v34 public-winning policy.
-#   - Keep v33 long-history Pass1 for all targets.
-#   - Retrain only Q3/S4 in Pass2, using a limited cross-target source set.
-#   - Final candidates anchor non-winning targets to v32, with Q1=Pass1 and Q3/S4=limited Pass2.
+# v36: target-specialized long-history + relational cross-target refinement.
+#   - Strengthen Pass1 target-history features with long-term level/variance/count statistics.
+#   - Retrain only Q3/S4 in Pass2, but keep the full cross-target source set that worked in v34.
+#   - Add relational summaries over Pass1 predictions instead of relying only on raw cross probabilities.
+#   - Final candidates anchor non-winning targets to v32, with Q1=Pass1 and Q3/S4=refined Pass2.
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -56,7 +57,7 @@ SUMMARY_DIR = OUTPUTS_DIR / 'summary'
 OOF_DIR     = OUTPUTS_DIR / 'oof'
 LOG_DIR     = OUTPUTS_DIR / 'log'
 
-EXP_TAG      = os.environ.get('V36_EXP_TAG', 'v36_limited_cross_q3s4')
+EXP_TAG      = os.environ.get('V36_EXP_TAG', 'v36_relational_cross_q3s4')
 RUN_LOG_PATH = LOG_DIR     / f'run_{EXP_TAG}.log'
 V32_SUB_PATH = OUTPUT_DIR / 'submission_v32_target_specialized_bidir_s2w0p675.csv'
 V32_OOF_PATH = OOF_DIR / 'oof_v32_target_specialized_bidir_s2w0p675.csv'
@@ -80,8 +81,10 @@ def parse_targets(raw, default):
 
 
 def parse_cross_source_map():
-    # Format: "Q3:Q1,S2,S4;S4:Q1,Q3,S2".
-    raw = os.environ.get('V36_CROSS_MAP', 'Q3:Q1,S2,S4;S4:Q1,Q3,S2')
+    # Format: "Q3:Q1,Q2,S1,S2,S3,S4;S4:Q1,Q2,Q3,S1,S2,S3".
+    raw = os.environ.get(
+        'V36_CROSS_MAP',
+        'Q3:Q1,Q2,S1,S2,S3,S4;S4:Q1,Q2,Q3,S1,S2,S3')
     result = {}
     for chunk in raw.split(';'):
         chunk = chunk.strip()
@@ -504,17 +507,34 @@ def _build_subject_history(history_df, target):
 def _encode_from_history(history_map, query_df, windows):
     rows = []
     for sid, d in query_df[['subject_id','lifelog_date']].itertuples(index=False):
+        row = {
+            'te_lag1': np.nan,
+            'te_hist_mean': np.nan,
+            'te_hist_std': np.nan,
+            'te_hist_count': 0.0,
+        }
+        for w in windows:
+            row[f'te_enc{w}'] = np.nan
+            row[f'te_enc_std{w}'] = np.nan
+            row[f'te_enc_count{w}'] = 0.0
         if sid not in history_map:
-            row = {'te_lag1': np.nan}
-            for w in windows: row[f'te_enc{w}'] = np.nan
-            rows.append(row); continue
+            rows.append(row)
+            continue
         dates  = history_map[sid]['dates']
         labels = history_map[sid]['labels']
         k      = np.searchsorted(dates, d, side='left')
         past   = labels[:k]
-        row    = {'te_lag1': past[-1] if len(past) > 0 else np.nan}
+        if len(past) > 0:
+            row['te_lag1'] = past[-1]
+            row['te_hist_mean'] = np.nanmean(past)
+            row['te_hist_std'] = np.nanstd(past)
+            row['te_hist_count'] = float(len(past))
         for w in windows:
-            row[f'te_enc{w}'] = np.nanmean(past[-w:]) if len(past) > 0 else np.nan
+            past_win = past[-w:]
+            if len(past_win) > 0:
+                row[f'te_enc{w}'] = np.nanmean(past_win)
+                row[f'te_enc_std{w}'] = np.nanstd(past_win)
+                row[f'te_enc_count{w}'] = float(len(past_win))
         rows.append(row)
     return pd.DataFrame(rows, index=query_df.index)
 
@@ -530,9 +550,12 @@ def _encode_bidirectional_from_history(history_map, query_df, windows):
         }
         for w in windows:
             row[f'te_fwd_enc{w}'] = np.nan
+            row[f'te_fwd_std{w}'] = np.nan
+            row[f'te_fwd_count{w}'] = 0.0
             row[f'te_bidir_mean{w}'] = np.nan
             row[f'te_bidir_gap{w}'] = np.nan
             row[f'te_bidir_agree{w}'] = np.nan
+            row[f'te_bidir_count{w}'] = 0.0
 
         if sid not in history_map:
             rows.append(row)
@@ -563,6 +586,9 @@ def _encode_bidirectional_from_history(history_map, query_df, windows):
             past_mean = np.nanmean(past_win) if len(past_win) > 0 else np.nan
             future_mean = np.nanmean(future_win) if len(future_win) > 0 else np.nan
             row[f'te_fwd_enc{w}'] = future_mean
+            row[f'te_fwd_std{w}'] = np.nanstd(future_win) if len(future_win) > 0 else np.nan
+            row[f'te_fwd_count{w}'] = float(len(future_win))
+            row[f'te_bidir_count{w}'] = float(len(past_win) + len(future_win))
 
             if not np.isnan(past_mean) and not np.isnan(future_mean):
                 row[f'te_bidir_mean{w}'] = 0.5 * (past_mean + future_mean)
@@ -605,6 +631,27 @@ def build_full_target_encoding(train_full, query_df, target, windows):
             _encode_bidirectional_from_history(hmap, query_df, windows).reset_index(drop=True)
         ], axis=1)
     return te
+
+def build_cross_feature_frame(preds, source_indices):
+    raw_cols = [f'cross_oof_{TARGETS[i]}' for i in source_indices]
+    raw = pd.DataFrame(preds[:, source_indices], columns=raw_cols)
+    arr = raw.to_numpy(dtype=float)
+    feats = raw.copy()
+    feats['cross_mean'] = np.nanmean(arr, axis=1)
+    feats['cross_std'] = np.nanstd(arr, axis=1)
+    feats['cross_min'] = np.nanmin(arr, axis=1)
+    feats['cross_max'] = np.nanmax(arr, axis=1)
+    feats['cross_range'] = feats['cross_max'] - feats['cross_min']
+    q_idx = [j for j, i in enumerate(source_indices) if TARGETS[i].startswith('Q')]
+    s_idx = [j for j, i in enumerate(source_indices) if TARGETS[i].startswith('S')]
+    if q_idx:
+        feats['cross_q_mean'] = np.nanmean(arr[:, q_idx], axis=1)
+    if s_idx:
+        feats['cross_s_mean'] = np.nanmean(arr[:, s_idx], axis=1)
+    if q_idx and s_idx:
+        feats['cross_qs_gap'] = feats['cross_q_mean'] - feats['cross_s_mean']
+    return feats
+
 
 def calibrate_probs(y_true, oof_prob, test_prob):
     oof_prob  = np.clip(oof_prob,  1e-7, 1-1e-7)
@@ -800,7 +847,7 @@ def _train_pass(train_full, test_full, feature_cols,
         print(f'  [Stability] {len(feature_cols)} → {len(stable_cols)} features selected')
 
         # --- [v36] Cross-target OOF 피처 준비 (Pass2에서만 사용) ---
-        # For limited Pass2, use only the source targets configured for the current target.
+        # Keep the full source set for Q3/S4 and add relational summaries over those predictions.
         # Optuna 튜닝 단계에도 동일하게 반영해 일관성 유지.
         if cross_source_map and target in cross_source_map:
             other_ti = [TARGETS.index(t) for t in cross_source_map[target] if t != target]
@@ -810,11 +857,11 @@ def _train_pass(train_full, test_full, feature_cols,
         has_cross    = (cross_oof is not None) and (cross_test is not None) and bool(other_ti)
 
         if has_cross:
-            cross_tr_full = pd.DataFrame(cross_oof[:, other_ti],  columns=cross_cols)
-            cross_te_full = pd.DataFrame(cross_test[:, other_ti], columns=cross_cols)
+            cross_tr_full = build_cross_feature_frame(cross_oof, other_ti)
+            cross_te_full = build_cross_feature_frame(cross_test, other_ti)
             # Optuna 튜닝에 쓸 전체 feature matrix (TE 없이, cross 포함)
             X_tune_use = pd.concat([X_train_use, cross_tr_full], axis=1)
-            print(f'  [v36] Cross-target features added: {cross_cols}')
+            print(f'  [v36] Cross-target features added: {list(cross_tr_full.columns)}')
         else:
             X_tune_use = X_train_use
 
@@ -999,10 +1046,10 @@ def _train_pass(train_full, test_full, feature_cols,
 
 
 def train_and_predict(train_full, test_full, feature_cols):
-    """2-pass limited cross-target chaining.
+    """2-pass relational cross-target refinement.
 
     Pass 1: 7개 타겟 독립 학습 → OOF/test 예측 획득.
-    Pass 2: Q3/S4만 limited cross-target sources로 재학습.
+    Pass 2: Q3/S4만 full cross-target sources + relational summaries로 재학습.
             나머지 타겟은 Pass1 값을 유지하고, 최종 제출에서는 v32 anchor와 조합한다.
 
     USE_CROSS_TARGET=0 이면 Pass1만 수행 (v29와 동일 동작).
@@ -1030,17 +1077,17 @@ def train_and_predict(train_full, test_full, feature_cols):
     pass2_targets = parse_targets('V36_PASS2_TARGETS', 'Q3,S4')
     cross_source_map = parse_cross_source_map()
     print(f'\n{"#"*55}')
-    print(f'# Pass 2 — Limited cross-target chaining')
+    print(f'# Pass 2 — Relational cross-target refinement')
     print(f'# targets={pass2_targets} cross_map={cross_source_map}')
     print(f'{"#"*55}')
     oof_pass2, test_pass2 = _train_pass(
         train_full, test_full, feature_cols,
-        cross_oof=oof_pass1, cross_test=test_pass1, pass_label='Pass2Limited',
+        cross_oof=oof_pass1, cross_test=test_pass1, pass_label='Pass2Refined',
         target_subset=pass2_targets, cross_source_map=cross_source_map,
         base_oof=oof_pass1, base_test=test_pass1
     )
 
-    print(f'\n[v36] Pass1 vs Pass2Limited OOF 비교:')
+    print(f'\n[v36] Pass1 vs Pass2Refined OOF 비교:')
     for i, t in enumerate(TARGETS):
         y = train_full[t].values
         p1 = log_loss(y, oof_pass1[:, i])
@@ -1111,12 +1158,12 @@ def _target_policy_frame(keys, anchor, pass1, limited, policy):
             out[target] = np.clip(anchor[target].values, 0.02, 0.98)
         elif source == 'pass1':
             out[target] = np.clip(pass1[target].values, 0.02, 0.98)
-        elif source == 'limited':
+        elif source == 'refined':
             out[target] = np.clip(limited[target].values, 0.02, 0.98)
         elif source == 'blend_pass1':
             out[target] = np.clip(
                 (1.0 - weight) * anchor[target].values + weight * pass1[target].values, 0.02, 0.98)
-        elif source == 'blend_limited':
+        elif source == 'blend_refined':
             out[target] = np.clip(
                 (1.0 - weight) * anchor[target].values + weight * limited[target].values, 0.02, 0.98)
         else:
@@ -1179,7 +1226,7 @@ def main():
         oof_df = _prediction_frame(train_keys, oof_preds)
         sub_pred_df = _prediction_frame(sub_keys, test_preds)
         frame_sets[label] = (oof_df, sub_pred_df)
-        candidate_name = f'{EXP_TAG}_limited_raw' if label == 'final' else f'{EXP_TAG}_{label}'
+        candidate_name = f'{EXP_TAG}_refined_raw' if label == 'final' else f'{EXP_TAG}_{label}'
         summaries.append(_save_candidate(candidate_name, train_full, oof_df, sub_pred_df))
 
     pass1_oof, pass1_sub = frame_sets['pass1']
@@ -1191,31 +1238,31 @@ def main():
         policy_specs = {
             EXP_TAG: {
                 'Q1': ('pass1', 1.0),
-                'Q3': ('limited', 1.0),
-                'S4': ('limited', 1.0),
+                'Q3': ('refined', 1.0),
+                'S4': ('refined', 1.0),
             },
-            f'{EXP_TAG}_q1p1_q3limited': {
+            f'{EXP_TAG}_q1p1_q3refined': {
                 'Q1': ('pass1', 1.0),
-                'Q3': ('limited', 1.0),
+                'Q3': ('refined', 1.0),
             },
-            f'{EXP_TAG}_q1p1_s4limited': {
+            f'{EXP_TAG}_q1p1_s4refined': {
                 'Q1': ('pass1', 1.0),
-                'S4': ('limited', 1.0),
+                'S4': ('refined', 1.0),
             },
-            f'{EXP_TAG}_q1p1_q3lim_s4blend70': {
+            f'{EXP_TAG}_q1p1_q3ref_s4blend70': {
                 'Q1': ('pass1', 1.0),
-                'Q3': ('limited', 1.0),
-                'S4': ('blend_limited', 0.70),
+                'Q3': ('refined', 1.0),
+                'S4': ('blend_refined', 0.70),
             },
-            f'{EXP_TAG}_q1p1_q3blend70_s4lim': {
+            f'{EXP_TAG}_q1p1_q3blend70_s4ref': {
                 'Q1': ('pass1', 1.0),
-                'Q3': ('blend_limited', 0.70),
-                'S4': ('limited', 1.0),
+                'Q3': ('blend_refined', 0.70),
+                'S4': ('refined', 1.0),
             },
-            f'{EXP_TAG}_q1blend50_q3s4lim': {
+            f'{EXP_TAG}_q1blend50_q3s4ref': {
                 'Q1': ('blend_pass1', 0.50),
-                'Q3': ('limited', 1.0),
-                'S4': ('limited', 1.0),
+                'Q3': ('refined', 1.0),
+                'S4': ('refined', 1.0),
             },
         }
         for name, policy in policy_specs.items():
