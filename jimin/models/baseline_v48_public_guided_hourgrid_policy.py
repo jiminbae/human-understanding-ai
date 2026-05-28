@@ -34,6 +34,10 @@ PUBLIC_CURVE_POINTS = {
     0.05: 0.5830874527,  # v47 non-S4 w05
     0.15: 0.5832548135,  # v47 non-S4 w15
 }
+PUBLIC_TARGET_POLICY_POINTS = {
+    'v48_public_curve_non_s4_w066': 0.5830810646,
+    'v48_target_delta_scaled_avg07': 0.5825356465,
+}
 
 
 def ensure_dirs():
@@ -171,6 +175,13 @@ def target_delta_scaled_weights(train, anchor_oof, raw_oof, avg_weight=0.07, cap
     return weights, gains
 
 
+def cap_weights(weights, caps):
+    capped = dict(weights)
+    for target, cap in caps.items():
+        capped[target] = min(float(capped.get(target, 0.0)), float(cap))
+    return capped
+
+
 def main():
     ensure_dirs()
     train = load_frame(TRAIN_PATH)
@@ -192,6 +203,37 @@ def main():
         avg_weight=0.07,
         cap=0.10,
         floor=0.03,
+    )
+    delta_scaled_variants = {}
+    variant_specs = [
+        ('v48_target_delta_scaled_avg075_cap11', 0.075, 0.11, 0.025),
+        ('v48_target_delta_scaled_avg080_cap12', 0.080, 0.12, 0.025),
+        ('v48_target_delta_scaled_avg085_cap12', 0.085, 0.12, 0.025),
+        ('v48_target_delta_scaled_avg090_cap13', 0.090, 0.13, 0.025),
+        ('v48_target_delta_scaled_avg100_cap14', 0.100, 0.14, 0.025),
+    ]
+    for name, avg_weight, cap, floor in variant_specs:
+        weights, _ = target_delta_scaled_weights(
+            train,
+            anchor_oof,
+            raw_oof,
+            avg_weight=avg_weight,
+            cap=cap,
+            floor=floor,
+        )
+        delta_scaled_variants[name] = weights
+
+    delta_scaled_variants['v48_target_delta_scaled_avg085_q3guard'] = cap_weights(
+        delta_scaled_variants['v48_target_delta_scaled_avg085_cap12'],
+        {'Q3': 0.038},
+    )
+    delta_scaled_variants['v48_target_delta_scaled_avg090_q3s3guard'] = cap_weights(
+        delta_scaled_variants['v48_target_delta_scaled_avg090_cap13'],
+        {'Q3': 0.040, 'S3': 0.066},
+    )
+    delta_scaled_variants['v48_target_delta_scaled_avg100_q3s3guard'] = cap_weights(
+        delta_scaled_variants['v48_target_delta_scaled_avg100_cap14'],
+        {'Q3': 0.040, 'S3': 0.070},
     )
 
     candidates = []
@@ -221,6 +263,7 @@ def main():
 
     target_policies = {
         'v48_target_delta_scaled_avg07': delta_scaled_weights,
+        **delta_scaled_variants,
         'v48_target_safe_scaled_avg065': {
             'Q1': 0.08, 'Q2': 0.06, 'Q3': 0.04,
             'S1': 0.08, 'S2': 0.08, 'S3': 0.06, 'S4': 0.0,
@@ -296,17 +339,18 @@ def main():
             'raw_submission': str(RAW_SUB),
         },
         'known_public_scores': PUBLIC_CURVE_POINTS,
+        'known_public_target_policy_scores': PUBLIC_TARGET_POLICY_POINTS,
         'public_curve_fit': public_fit,
         'anchor_oof': {'loss': anchor_loss, 'per_target': anchor_per_target},
         'raw_oof': {'loss': raw_loss, 'per_target': raw_per_target},
         'target_oof_gains_anchor_minus_raw': target_oof_gains,
         'candidates': candidates,
         'submission_recommendation': {
-            'score_exploit_first': 'submission_v48_public_curve_non_s4_w066.csv',
-            'direction_probe_second': 'submission_v48_target_delta_scaled_avg07.csv',
+            'score_exploit_first': 'submission_v48_target_delta_scaled_avg085_cap12.csv',
+            'direction_probe_second': 'submission_v48_target_delta_scaled_avg100_q3s3guard.csv',
             'reason': (
-                'Public w05 improved and w15 regressed, so the fitted optimum is near 0.066. '
-                'Target-delta scaling is the next probe if one wants signal for v49 rather than the safest score attempt.'
+                'The target-delta avg07 candidate beat the uniform public curve by a large margin. '
+                'The next useful probe is a moderate strength increase; if that still improves, test the guarded high-strength variant.'
             ),
         },
     }
